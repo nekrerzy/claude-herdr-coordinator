@@ -51,9 +51,15 @@ def coord(tmp_path, monkeypatch):
     monkeypatch.delenv("COORD_ROLE", raising=False)
     mod.cmd_init(None)
     atomic = mod.atomic_write
-    atomic(home / "policy.json", json.dumps({"watch": {"poll_seconds": 1, "idle_confirm_seconds": 0,
-                                                       "toast": False},
-                                             "worktree_root": str(tmp_path / "worktrees")}))
+    atomic(
+        home / "policy.json",
+        json.dumps(
+            {
+                "watch": {"poll_seconds": 1, "idle_confirm_seconds": 0, "toast": False},
+                "worktree_root": str(tmp_path / "worktrees"),
+            }
+        ),
+    )
 
     def set_herdr(agents, panes=None):
         state.write_text(json.dumps({"agents": agents, "panes": panes or [a["pane_id"] for a in agents]}))
@@ -70,8 +76,9 @@ def make_repo(path: Path) -> Path:
     (path / "a.txt").write_text("one\n")
     (path / "uv.lock").write_text("lock\n")
     subprocess.run(["git", "-C", str(path), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"],
-                   check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], check=True
+    )
     return path
 
 
@@ -85,15 +92,28 @@ def add_running_task(coord, title="demo", pane="w1:p9", session="s-1"):
     with coord.registry_edit() as reg:
         tid = next(iter(t for t in reg["tasks"] if title in t))
         task = reg["tasks"][tid]
-        task["worker"] = {"agent_name": "w001", "pane_id": pane, "session_id": session, "launched": "x",
-                          "status": "prompted", "prompted": "x", "model": task["model"], "effort": task["effort"]}
+        task["worker"] = {
+            "agent_name": "w001",
+            "pane_id": pane,
+            "session_id": session,
+            "launched": "x",
+            "status": "prompted",
+            "prompted": "x",
+            "model": task["model"],
+            "effort": task["effort"],
+        }
         coord.set_state(task, "running")
     return tid
 
 
 def agent(pane, status, seq, session="s-1"):
-    return {"pane_id": pane, "agent": "claude", "agent_status": status, "state_change_seq": seq,
-            "agent_session": {"value": session}}
+    return {
+        "pane_id": pane,
+        "agent": "claude",
+        "agent_status": status,
+        "state_change_seq": seq,
+        "agent_session": {"value": session},
+    }
 
 
 def inbox(coord):
@@ -110,7 +130,11 @@ def test_resolve_model_rejects_unsupported(coord):
     policy = coord.load_policy()
     assert coord.resolve_model(policy, "complex", None, None)["model"] == "claude-opus-5-5"
     assert coord.resolve_model(policy, "exceptional", None, None) == {
-        "tier": "exceptional", "model": "claude-fable-5-1", "effort": "high", "source": "tier:exceptional"}
+        "tier": "exceptional",
+        "model": "claude-fable-5-1",
+        "effort": "high",
+        "source": "tier:exceptional",
+    }
     with pytest.raises(coord.CoordError):
         coord.resolve_model(policy, "routine", None, "ultra")
     with pytest.raises(coord.CoordError):
@@ -216,10 +240,13 @@ def test_overlap_detection_and_worker_guard(coord, monkeypatch):
 
 
 def test_cli_runs_with_system_python():
-    out = subprocess.run([sys.executable, str(ROOT / "bin" / "coord"), "--help"], capture_output=True, text=True,
-                         env={**os.environ, "COORD_HOME": "/nonexistent"})
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "bin" / "coord"), "--help"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "COORD_HOME": "/nonexistent"},
+    )
     assert out.returncode == 0 and "relaunch" in out.stdout
-
 
 
 def test_idle_before_kickoff_is_not_a_completion(coord):

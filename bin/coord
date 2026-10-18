@@ -43,14 +43,35 @@ ACTIVE_STATES = ("running", "blocked", "ready_for_review")
 REPORT_STATES = ("running", "blocked", "ready_for_review", "failed")
 AGENT_LIVE = ("working", "idle", "done", "blocked", "unknown")
 LOCKFILES = {
-    "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "uv.lock", "poetry.lock",
-    "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock", "flake.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "uv.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+    "go.sum",
+    "Gemfile.lock",
+    "composer.lock",
+    "flake.lock",
 }
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
-WORKER_DENY = ["Bash(coord launch *)", "Bash(coord relaunch *)", "Bash(coord kick *)", "Bash(coord cancel *)",
-               "Bash(coord close *)", "Bash(coord escalate *)", "Bash(coord prompt *)", "Bash(coord set *)",
-               "Bash(coord task *)", "Bash(coord repo *)", "Bash(coord cleanup *)", "Bash(coord watch *)",
-               "Bash(herdr *)"]
+WORKER_DENY = [
+    "Bash(coord launch *)",
+    "Bash(coord relaunch *)",
+    "Bash(coord kick *)",
+    "Bash(coord cancel *)",
+    "Bash(coord close *)",
+    "Bash(coord escalate *)",
+    "Bash(coord prompt *)",
+    "Bash(coord set *)",
+    "Bash(coord task *)",
+    "Bash(coord repo *)",
+    "Bash(coord cleanup *)",
+    "Bash(coord watch *)",
+    "Bash(herdr *)",
+]
 TOAST_KINDS = {"blocked", "blocked_dialog", "ready_for_review", "failed", "exited", "idle_no_report"}
 
 DEFAULT_POLICY: dict[str, Any] = {
@@ -85,6 +106,7 @@ class HerdrError(CoordError):
 
 
 # ---------------------------------------------------------------- utilities
+
 
 def now_iso() -> str:
     return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
@@ -164,6 +186,7 @@ def short_model(model: str | None) -> str:
 
 # ------------------------------------------------------------------ policy
 
+
 def load_policy() -> dict:
     policy = json.loads(json.dumps(DEFAULT_POLICY))
     user = read_json(HOME / "policy.json", {}) or {}
@@ -196,9 +219,9 @@ def resolve_model(policy: dict, tier: str, model: str | None, effort: str | None
 
 # ---------------------------------------------------------------- registry
 
+
 def empty_registry() -> dict:
-    return {"version": 1, "seq": 0, "repos": {}, "initiatives": {}, "tasks": {},
-            "coordinator": {}, "workers_tab": None}
+    return {"version": 1, "seq": 0, "repos": {}, "initiatives": {}, "tasks": {}, "coordinator": {}, "workers_tab": None}
 
 
 def load_registry() -> dict:
@@ -236,8 +259,10 @@ def set_state(task: dict, state: str, note: str = "") -> None:
 
 
 def log_event(kind: str, task_id: str | None, text: str, **extra: Any) -> None:
-    append_line(HOME / "events.jsonl", {"ts": now_iso(), "source": "coord", "kind": kind,
-                                        "task": task_id, "text": text, **extra})
+    append_line(
+        HOME / "events.jsonl",
+        {"ts": now_iso(), "source": "coord", "kind": kind, "task": task_id, "text": text, **extra},
+    )
 
 
 def guard_not_worker() -> None:
@@ -247,18 +272,24 @@ def guard_not_worker() -> None:
 
 def guard_herdr() -> None:
     if os.environ.get("HERDR_ENV") != "1":
-        raise CoordError("not inside a Herdr pane (HERDR_ENV != 1). Start Herdr, open a pane, "
-                         "and run the coordinator there (see docs/OPERATING.md).")
+        raise CoordError(
+            "not inside a Herdr pane (HERDR_ENV != 1). Start Herdr, open a pane, "
+            "and run the coordinator there (see docs/OPERATING.md)."
+        )
 
 
 # ------------------------------------------------------------------- herdr
+
 
 def herdr(*args: Any, timeout: float | None = 120, raw: bool = False) -> Any:
     try:
         proc = subprocess.run([HERDR, *map(str, args)], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise HerdrError("timeout", f"herdr {args[0]} {args[1] if len(args) > 1 else ''} timed out "
-                         "(the action may still have happened; inspect before retrying)") from None
+        raise HerdrError(
+            "timeout",
+            f"herdr {args[0]} {args[1] if len(args) > 1 else ''} timed out "
+            "(the action may still have happened; inspect before retrying)",
+        ) from None
     if proc.returncode != 0:
         lines = proc.stderr.strip().splitlines()
         try:
@@ -310,6 +341,7 @@ def live_state(task: dict, agents: dict[str, dict]) -> tuple[str, int | None]:
 
 # --------------------------------------------------------------------- git
 
+
 def git(cwd: Path | str, *args: str) -> str:
     proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
     if proc.returncode != 0:
@@ -318,11 +350,14 @@ def git(cwd: Path | str, *args: str) -> str:
 
 
 def branch_exists(repo: Path, branch: str) -> bool:
-    return subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
-                           f"refs/heads/{branch}"]).returncode == 0
+    return (
+        subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode
+        == 0
+    )
 
 
 # -------------------------------------------------------------- transcripts
+
 
 def transcript_path(session_id: str | None) -> Path | None:
     if not session_id:
@@ -334,8 +369,14 @@ def transcript_path(session_id: str | None) -> Path | None:
 def observe_session(session_id: str | None) -> dict:
     """Read the actual model/effort/advisor and token usage from a Claude transcript."""
     path = transcript_path(session_id)
-    out: dict[str, Any] = {"transcript": str(path) if path else None, "model": None,
-                           "effort": None, "advisor": None, "turns": 0, "usage": None}
+    out: dict[str, Any] = {
+        "transcript": str(path) if path else None,
+        "model": None,
+        "effort": None,
+        "advisor": None,
+        "turns": 0,
+        "usage": None,
+    }
     if not path:
         return out
     usage_by_request: dict[str, dict] = {}
@@ -344,8 +385,12 @@ def observe_session(session_id: str | None) -> dict:
             continue
         msg = entry.get("message") or {}
         if msg.get("model") and msg.get("model") != "<synthetic>":
-            out.update(model=msg["model"], effort=entry.get("effort"),
-                       advisor=entry.get("advisorModel"), requested=entry.get("requestedModel"))
+            out.update(
+                model=msg["model"],
+                effort=entry.get("effort"),
+                advisor=entry.get("advisorModel"),
+                requested=entry.get("requestedModel"),
+            )
         if msg.get("usage") and entry.get("requestId"):
             usage_by_request[entry["requestId"]] = msg["usage"]
     out["turns"] = len(usage_by_request)
@@ -360,6 +405,7 @@ def read_report(task_id: str) -> dict | None:
 
 
 # ------------------------------------------------------------ brief render
+
 
 def task_paths(task: dict, repo: str) -> list[str]:
     out = []
@@ -396,8 +442,13 @@ def render_brief(reg: dict, task: dict, plan: list[dict]) -> str:
         if init.get("order"):
             lines += [f"Integration order: {' -> '.join(init['order'])}"]
         lines.append("")
-    lines += [f"Assigned: {task['model']} at {task['effort']} effort ({task['model_source']})", "",
-              "## Objective", task.get("objective") or task["title"], ""]
+    lines += [
+        f"Assigned: {task['model']} at {task['effort']} effort ({task['model_source']})",
+        "",
+        "## Objective",
+        task.get("objective") or task["title"],
+        "",
+    ]
     if task.get("acceptance"):
         lines += ["## Acceptance criteria"] + [f"- {a}" for a in task["acceptance"]] + [""]
     if task.get("context"):
@@ -409,36 +460,52 @@ def render_brief(reg: dict, task: dict, plan: list[dict]) -> str:
         repo = reg["repos"][p["repo"]]
         if p["mode"] == "edit":
             allowed = task_paths(task, p["repo"]) or ["(whole repository)"]
-            lines += [f"- **{p['repo']}** (edit) — work only in `{p['worktree']}`",
-                      f"  - branch `{p['branch']}`, base commit `{p['base_commit'][:12]}`",
-                      f"  - permitted paths: {', '.join(allowed)}"]
+            lines += [
+                f"- **{p['repo']}** (edit) — work only in `{p['worktree']}`",
+                f"  - branch `{p['branch']}`, base commit `{p['base_commit'][:12]}`",
+                f"  - permitted paths: {', '.join(allowed)}",
+            ]
             shared = [s for s in repo.get("shared_paths", []) if s not in allowed]
             if shared:
                 lines.append(f"  - off-limits shared paths: {', '.join(shared)}")
             if p.get("source_dirty"):
-                lines.append(f"  - note: the original checkout `{repo['path']}` has uncommitted changes "
-                             "that are NOT in your worktree; do not copy or modify them.")
+                lines.append(
+                    f"  - note: the original checkout `{repo['path']}` has uncommitted changes "
+                    "that are NOT in your worktree; do not copy or modify them."
+                )
         else:
             lines += [f"- **{p['repo']}** (read-only) — `{p['path']}`; do not modify."]
         for ins in repo.get("instructions", []):
             lines.append(f"  - read repo instructions first: `{ins}`")
-    lines += ["", "## Constraints",
-              "- Local commits on your branch are allowed; no push, merge, deploy, or destructive cleanup."]
+    lines += [
+        "",
+        "## Constraints",
+        "- Local commits on your branch are allowed; no push, merge, deploy, or destructive cleanup.",
+    ]
     lines += [f"- {c}" for c in task.get("constraints", [])]
-    lines += ["", "## Resources",
-              f"- Ports: {task['port_base']}-{task['port_base'] + 9} (env COORD_PORT_BASE)",
-              f"- TMPDIR: `{d / 'tmp'}`", "",
-              "## Validation required"]
+    lines += [
+        "",
+        "## Resources",
+        f"- Ports: {task['port_base']}-{task['port_base'] + 9} (env COORD_PORT_BASE)",
+        f"- TMPDIR: `{d / 'tmp'}`",
+        "",
+        "## Validation required",
+    ]
     lines += [f"- `{v}`" for v in task.get("validation", [])] or ["- Run the relevant existing tests."]
-    lines += ["", "## Coordination files",
-              f"- Progress (append): `{d / 'progress.md'}`",
-              f"- Result (write when done): `{d / 'result.md'}`",
-              "- Report state with `coord report --state <state> --summary \"...\"`", ""]
+    lines += [
+        "",
+        "## Coordination files",
+        f"- Progress (append): `{d / 'progress.md'}`",
+        f"- Result (write when done): `{d / 'result.md'}`",
+        '- Report state with `coord report --state <state> --summary "..."`',
+        "",
+    ]
     lines.append((TOOL_DIR / "prompts" / "worker.md").read_text())
     return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ status
+
 
 def sync_states(reg: dict, agents: dict[str, dict]) -> list[str]:
     """Fold worker reports and live Herdr state into registry states (coordinator-owned)."""
@@ -489,6 +556,7 @@ def next_action(reg: dict, task: dict, live: str, report: dict) -> str:
 
 # ---------------------------------------------------------------- commands
 
+
 def cmd_init(args: argparse.Namespace) -> None:
     for sub in ("tasks", "logs"):
         (HOME / sub).mkdir(parents=True, exist_ok=True)
@@ -510,8 +578,12 @@ def cmd_coordinator(args: argparse.Namespace) -> None:
         rec = reg["coordinator"]
         if sid and rec.get("session_id") and rec["session_id"] != sid:
             rec.setdefault("previous_sessions", []).append(rec["session_id"])
-        rec.update(session_id=sid, pane_id=os.environ.get("HERDR_PANE_ID"),
-                   workspace_id=os.environ.get("HERDR_WORKSPACE_ID"), registered=now_iso())
+        rec.update(
+            session_id=sid,
+            pane_id=os.environ.get("HERDR_PANE_ID"),
+            workspace_id=os.environ.get("HERDR_WORKSPACE_ID"),
+            registered=now_iso(),
+        )
         obs = observe_session(sid)
         rec["observed"] = {k: obs[k] for k in ("model", "effort", "advisor")}
     print(json.dumps(rec, indent=2))
@@ -531,11 +603,18 @@ def cmd_repo_add(args: argparse.Namespace) -> None:
         old = reg["repos"].get(args.name)
         if old and old["path"] != str(top):
             raise CoordError(f"repo {args.name!r} already registered at {old['path']}")
-        reg["repos"][args.name] = {"name": args.name, "path": str(top), "kind": args.kind,
-                                   "instructions": instructions, "shared_paths": shared,
-                                   "registered": (old or {}).get("registered", now_iso())}
-    print(f"{'updated' if old else 'registered'} {args.name}: {top} kind={args.kind} "
-          f"shared={shared or '-'} instructions={instructions or '-'}")
+        reg["repos"][args.name] = {
+            "name": args.name,
+            "path": str(top),
+            "kind": args.kind,
+            "instructions": instructions,
+            "shared_paths": shared,
+            "registered": (old or {}).get("registered", now_iso()),
+        }
+    print(
+        f"{'updated' if old else 'registered'} {args.name}: {top} kind={args.kind} "
+        f"shared={shared or '-'} instructions={instructions or '-'}"
+    )
 
 
 def cmd_repo_list(args: argparse.Namespace) -> None:
@@ -551,10 +630,13 @@ def cmd_initiative_add(args: argparse.Namespace) -> None:
             if r not in reg["repos"]:
                 raise CoordError(f"unknown repo {r!r}")
         init = reg["initiatives"].setdefault(args.id, {"id": args.id, "created": now_iso(), "decisions": []})
-        init.update(title=args.title, goal=args.goal or init.get("goal", ""),
-                    repos=args.repos or init.get("repos", []),
-                    order=args.order.split(",") if args.order else init.get("order", []),
-                    interfaces=args.interface or init.get("interfaces", []))
+        init.update(
+            title=args.title,
+            goal=args.goal or init.get("goal", ""),
+            repos=args.repos or init.get("repos", []),
+            order=args.order.split(",") if args.order else init.get("order", []),
+            interfaces=args.interface or init.get("interfaces", []),
+        )
     print(f"initiative {args.id}: {args.title}")
 
 
@@ -598,15 +680,28 @@ def cmd_task_add(args: argparse.Namespace) -> None:
         seq = reg["seq"]
         tid = args.id or f"t{seq:03d}-{slugify(args.title)}"
         task = {
-            "id": tid, "seq": seq, "title": args.title, "initiative": args.initiative,
-            "objective": args.objective, "acceptance": args.accept or [], "context": args.context,
-            "constraints": args.constraint or [], "validation": args.validate or [],
-            "brief_extra": brief_extra, "repos": repos, "paths": args.paths or [],
+            "id": tid,
+            "seq": seq,
+            "title": args.title,
+            "initiative": args.initiative,
+            "objective": args.objective,
+            "acceptance": args.accept or [],
+            "context": args.context,
+            "constraints": args.constraint or [],
+            "validation": args.validate or [],
+            "brief_extra": brief_extra,
+            "repos": repos,
+            "paths": args.paths or [],
             "depends_on": [get_task(reg, d)["id"] for d in args.depends_on or []],
             "permission_mode": args.permission_mode or policy["default_permission_mode"],
             "port_base": policy["port_base"] + (seq % 1000) * policy["port_block"],
-            "escalation_of": None, "escalations": [], "worker": None, "worker_history": [],
-            "validation_evidence": [], "created": now_iso(), **sel,
+            "escalation_of": None,
+            "escalations": [],
+            "worker": None,
+            "worker_history": [],
+            "validation_evidence": [],
+            "created": now_iso(),
+            **sel,
             "model_source": sel["source"],
         }
         task.pop("source")
@@ -637,10 +732,16 @@ def cmd_task_set(args: argparse.Namespace) -> None:
             sel = resolve_model(policy, sel["tier"], None, None)
         before = (task["model"], task["effort"])
         task.update(tier=sel["tier"], model=sel["model"], effort=sel["effort"], model_source=sel["source"])
-        task["escalations"].append({"ts": now_iso(), "from": before, "to": (sel["model"], sel["effort"]),
-                                    "reason": args.reason or "override", "applied": "next launch"})
-    print(f"{task['id']}: {before[0]}/{before[1]} -> {sel['model']}/{sel['effort']} "
-          f"(applies at next launch/relaunch)")
+        task["escalations"].append(
+            {
+                "ts": now_iso(),
+                "from": before,
+                "to": (sel["model"], sel["effort"]),
+                "reason": args.reason or "override",
+                "applied": "next launch",
+            }
+        )
+    print(f"{task['id']}: {before[0]}/{before[1]} -> {sel['model']}/{sel['effort']} (applies at next launch/relaunch)")
 
 
 def plan_repos(reg: dict, task: dict, policy: dict) -> list[dict]:
@@ -657,9 +758,17 @@ def plan_repos(reg: dict, task: dict, policy: dict) -> list[dict]:
             continue
         src = Path(repo["path"])
         dirty = [line for line in git(src, "status", "--porcelain").splitlines() if line]
-        plan.append({"repo": r["repo"], "mode": "edit", "source": str(src),
-                     "worktree": str(root / r["repo"] / task["id"]), "branch": f"coord/{task['id']}",
-                     "base_commit": git(src, "rev-parse", "HEAD"), "source_dirty": dirty})
+        plan.append(
+            {
+                "repo": r["repo"],
+                "mode": "edit",
+                "source": str(src),
+                "worktree": str(root / r["repo"] / task["id"]),
+                "branch": f"coord/{task['id']}",
+                "base_commit": git(src, "rev-parse", "HEAD"),
+                "source_dirty": dirty,
+            }
+        )
     return plan
 
 
@@ -700,9 +809,19 @@ def ensure_workers_tab(policy: dict) -> str:
     tab = reg.get("workers_tab") or {}
     if tab.get("anchor_pane") and pane_exists(tab["anchor_pane"]):
         return tab["anchor_pane"]
-    res = herdr("tab", "create", "--workspace", os.environ["HERDR_WORKSPACE_ID"],
-                "--label", policy["workers_tab_label"], "--cwd", str(HOME),
-                "--env", f"COORD_HOME={HOME}", "--no-focus")["result"]
+    res = herdr(
+        "tab",
+        "create",
+        "--workspace",
+        os.environ["HERDR_WORKSPACE_ID"],
+        "--label",
+        policy["workers_tab_label"],
+        "--cwd",
+        str(HOME),
+        "--env",
+        f"COORD_HOME={HOME}",
+        "--no-focus",
+    )["result"]
     anchor = res["root_pane"]["pane_id"]
     with registry_edit() as reg:
         reg["workers_tab"] = {"tab_id": res["tab"]["tab_id"], "anchor_pane": anchor, "created": now_iso()}
@@ -719,13 +838,18 @@ def new_worker_pane(anchor: str, cwd: str, env: dict[str, str]) -> str:
     env_args: list[str] = []
     for k, v in env.items():
         env_args += ["--env", f"{k}={v}"]
-    res = herdr("pane", "split", biggest["pane_id"], "--direction", direction, "--cwd", cwd,
-                "--no-focus", *env_args)
+    res = herdr("pane", "split", biggest["pane_id"], "--direction", direction, "--cwd", cwd, "--no-focus", *env_args)
     return res["result"]["pane"]["pane_id"]
 
 
-def start_worker(task_id: str, *, resume: str | None = None, fork_from: str | None = None,
-                 kickoff: str | None = None, dry_run: bool = False) -> None:
+def start_worker(
+    task_id: str,
+    *,
+    resume: str | None = None,
+    fork_from: str | None = None,
+    kickoff: str | None = None,
+    dry_run: bool = False,
+) -> None:
     """Create worktrees, a pane, and an interactive Claude worker; record every identity."""
     policy = load_policy()
     with locked(HOME / "worktrees.lock"):
@@ -743,8 +867,7 @@ def start_worker(task_id: str, *, resume: str | None = None, fork_from: str | No
     d = task_dir(tid)
     session_id = resume or str(uuid.uuid4())
     agent_name = f"{policy['agent_prefix']}{task['seq']:03d}-{slugify(task['title'], 24)}"[:32]
-    claude_args = ["--model", task["model"], "--effort", task["effort"], "--name", tid,
-                   "--add-dir", str(d)]
+    claude_args = ["--model", task["model"], "--effort", task["effort"], "--name", tid, "--add-dir", str(d)]
     if fork_from:
         claude_args += ["--resume", fork_from, "--fork-session"]
     elif resume and transcript_path(resume):
@@ -758,29 +881,57 @@ def start_worker(task_id: str, *, resume: str | None = None, fork_from: str | No
     if task.get("permission_mode"):
         claude_args += ["--permission-mode", task["permission_mode"]]
     registry_file = HOME / "registry.json"
-    claude_args += ["--disallowedTools", ",".join(WORKER_DENY + [f"Edit(/{registry_file})",
-                                                                  f"Write(/{registry_file})"])]
-    env = {"COORD_HOME": str(HOME), "COORD_TASK_ID": tid, "COORD_ROLE": "worker",
-           "COORD_PORT_BASE": str(task["port_base"]), "TMPDIR": str(d / "tmp"),
-           "CLAUDE_CODE_EFFORT_LEVEL": task["effort"]}
+    claude_args += [
+        "--disallowedTools",
+        ",".join(WORKER_DENY + [f"Edit(/{registry_file})", f"Write(/{registry_file})"]),
+    ]
+    env = {
+        "COORD_HOME": str(HOME),
+        "COORD_TASK_ID": tid,
+        "COORD_ROLE": "worker",
+        "COORD_PORT_BASE": str(task["port_base"]),
+        "TMPDIR": str(d / "tmp"),
+        "CLAUDE_CODE_EFFORT_LEVEL": task["effort"],
+    }
     if policy.get("advisor", "disabled") == "disabled":
         env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
     if dry_run:
-        print(json.dumps({"task": tid, "agent_name": agent_name, "cwd": cwd, "env": env,
-                          "command": ["claude", *claude_args], "repos": plan}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "task": tid,
+                    "agent_name": agent_name,
+                    "cwd": cwd,
+                    "env": env,
+                    "command": ["claude", *claude_args],
+                    "repos": plan,
+                },
+                indent=2,
+            )
+        )
         return
     (d / "tmp").mkdir(parents=True, exist_ok=True)
     reg = load_registry()
     atomic_write(d / "brief.md", render_brief(reg, reg["tasks"][tid], plan))
     for p in plan:
         if p.get("source_dirty"):
-            print(f"note: {p['source']} has uncommitted changes the worker will NOT see: "
-                  f"{len(p['source_dirty'])} path(s)")
+            print(
+                f"note: {p['source']} has uncommitted changes the worker will NOT see: {len(p['source_dirty'])} path(s)"
+            )
     anchor = ensure_workers_tab(policy)
     pane = new_worker_pane(anchor, cwd, env)
-    worker = {"agent_name": agent_name, "pane_id": pane, "session_id": None if fork_from else session_id,
-              "fork_from": fork_from, "resumed_from": resume, "cwd": cwd, "model": task["model"],
-              "effort": task["effort"], "launched": now_iso(), "status": "starting"}
+    worker = {
+        "agent_name": agent_name,
+        "pane_id": pane,
+        "session_id": None if fork_from else session_id,
+        "fork_from": fork_from,
+        "resumed_from": resume,
+        "cwd": cwd,
+        "model": task["model"],
+        "effort": task["effort"],
+        "launched": now_iso(),
+        "status": "starting",
+    }
     with registry_edit() as reg:
         t = reg["tasks"][tid]
         if t.get("worker"):
@@ -789,15 +940,29 @@ def start_worker(task_id: str, *, resume: str | None = None, fork_from: str | No
     log_event("worker_pane", tid, f"pane {pane} for {agent_name}", pane=pane)
     time.sleep(0.5)
     try:
-        herdr("agent", "start", agent_name, "--kind", "claude", "--pane", pane, "--timeout", "90000",
-              "--", *claude_args, timeout=120)
+        herdr(
+            "agent",
+            "start",
+            agent_name,
+            "--kind",
+            "claude",
+            "--pane",
+            pane,
+            "--timeout",
+            "90000",
+            "--",
+            *claude_args,
+            timeout=120,
+        )
     except CoordError as exc:
         with registry_edit() as reg:
             reg["tasks"][tid]["worker"]["status"] = f"start_error:{getattr(exc, 'code', 'error')}"
             set_state(reg["tasks"][tid], "blocked", f"worker start: {exc}")
-        raise CoordError(f"{exc}. Do not relaunch before inspecting. Pane {pane} kept: `coord peek {tid}`. "
-                         "If a trust/consent dialog is shown, answer it yourself, then `coord kick "
-                         f"{tid}`.") from None
+        raise CoordError(
+            f"{exc}. Do not relaunch before inspecting. Pane {pane} kept: `coord peek {tid}`. "
+            "If a trust/consent dialog is shown, answer it yourself, then `coord kick "
+            f"{tid}`."
+        ) from None
     kick(tid, kickoff)
 
 
@@ -812,12 +977,26 @@ def kick(task_id: str, kickoff: str | None = None) -> None:
         agent = live_agents().get(worker["pane_id"]) or {}
     except CoordError:
         agent = {}
-    text = kickoff or (f"You are a coord worker for task {tid}. Read your brief at "
-                       f"{task_dir(tid) / 'brief.md'} in full, then carry it out now, following its "
-                       "Worker protocol section.")
+    text = kickoff or (
+        f"You are a coord worker for task {tid}. Read your brief at "
+        f"{task_dir(tid) / 'brief.md'} in full, then carry it out now, following its "
+        "Worker protocol section."
+    )
     try:
-        herdr("agent", "prompt", worker["pane_id"], text, "--wait", "--until", "working",
-              "--until", "blocked", "--timeout", "30000", timeout=60)
+        herdr(
+            "agent",
+            "prompt",
+            worker["pane_id"],
+            text,
+            "--wait",
+            "--until",
+            "working",
+            "--until",
+            "blocked",
+            "--timeout",
+            "30000",
+            timeout=60,
+        )
         status = "prompted"
     except CoordError as exc:
         status = f"prompt_unconfirmed:{getattr(exc, 'code', 'error')}"  # never auto-resend; inspect first
@@ -831,8 +1010,10 @@ def kick(task_id: str, kickoff: str | None = None) -> None:
             w["session_id"] = w.get("session_id") or reported
         set_state(t, "running", f"launched {w['agent_name']} in {w['pane_id']} ({status})")
     log_event("launched", tid, f"{worker['agent_name']} {status}", pane=worker["pane_id"])
-    print(f"{tid}: {worker['agent_name']} pane={worker['pane_id']} session={worker.get('session_id')} "
-          f"{task['model']}/{task['effort']} [{status}]")
+    print(
+        f"{tid}: {worker['agent_name']} pane={worker['pane_id']} session={worker.get('session_id')} "
+        f"{task['model']}/{task['effort']} [{status}]"
+    )
 
 
 def cmd_launch(args: argparse.Namespace) -> None:
@@ -846,8 +1027,10 @@ def cmd_launch(args: argparse.Namespace) -> None:
         agents = live_agents()
         live, _ = live_state(task, agents)
         if live in AGENT_LIVE:
-            raise CoordError(f"{tid} already has a live worker ({task['worker']['agent_name']} in "
-                             f"{task['worker']['pane_id']}, {live}); not launching a duplicate")
+            raise CoordError(
+                f"{tid} already has a live worker ({task['worker']['agent_name']} in "
+                f"{task['worker']['pane_id']}, {live}); not launching a duplicate"
+            )
         if task.get("worker"):
             raise CoordError(f"{tid} already had a worker (now {live}); use `coord relaunch {tid}` to resume it")
         if task["state"] != "planned":
@@ -864,12 +1047,16 @@ def check_capacity(reg: dict, task: dict, agents: dict, policy: dict, allow_over
     """Enforce the global worker cap and per-repo path ownership before starting a worker."""
     active = sum(1 for t in reg["tasks"].values() if live_state(t, agents)[0] in AGENT_LIVE)
     if active >= policy["max_active_workers"]:
-        raise CoordError(f"{active} active workers (max {policy['max_active_workers']}); "
-                         "close, finish or cancel one first")
+        raise CoordError(
+            f"{active} active workers (max {policy['max_active_workers']}); close, finish or cancel one first"
+        )
     problems = check_conflicts(reg, task, agents)
     if problems and not allow_overlap:
-        raise CoordError("ownership conflict:\n  " + "\n  ".join(problems) +
-                         "\nserialize with --depends-on, narrow --paths, or pass --allow-overlap")
+        raise CoordError(
+            "ownership conflict:\n  "
+            + "\n  ".join(problems)
+            + "\nserialize with --depends-on, narrow --paths, or pass --allow-overlap"
+        )
 
 
 def cmd_kick(args: argparse.Namespace) -> None:
@@ -960,15 +1147,23 @@ def cmd_relaunch(args: argparse.Namespace) -> None:
             with registry_edit() as reg:
                 t = reg["tasks"][tid]
                 t.update(tier=sel["tier"], model=sel["model"], effort=sel["effort"], model_source=sel["source"])
-                t["escalations"].append({"ts": now_iso(), "from": before, "to": (sel["model"], sel["effort"]),
-                                         "reason": args.reason or "relaunch override", "applied": "relaunch"})
+                t["escalations"].append(
+                    {
+                        "ts": now_iso(),
+                        "from": before,
+                        "to": (sel["model"], sel["effort"]),
+                        "reason": args.reason or "relaunch override",
+                        "applied": "relaunch",
+                    }
+                )
         resume = None if args.fresh else task["worker"].get("session_id")
         reg = load_registry()
         t = reg["tasks"][tid]
-        kickoff = (f"The coordinator restarted you for task {tid} (now {t['model']} at {t['effort']} effort). "
-                   f"Re-read your brief at {task_dir(tid) / 'brief.md'} and progress at "
-                   f"{task_dir(tid) / 'progress.md'}; do not repeat completed work. Continue the task. "
-                   + (args.message or ""))
+        kickoff = (
+            f"The coordinator restarted you for task {tid} (now {t['model']} at {t['effort']} effort). "
+            f"Re-read your brief at {task_dir(tid) / 'brief.md'} and progress at "
+            f"{task_dir(tid) / 'progress.md'}; do not repeat completed work. Continue the task. " + (args.message or "")
+        )
         start_worker(tid, resume=resume, kickoff=kickoff)
 
 
@@ -988,27 +1183,53 @@ def cmd_escalate(args: argparse.Namespace) -> None:
         for r in parent["repos"]:
             wt = next((w["worktree"] for w in parent.get("worktrees", []) if w["repo"] == r["repo"]), None)
             repos.append({"repo": r["repo"], "mode": "read", "path": wt or reg["repos"][r["repo"]]["path"]})
-        context = (f"Escalated from task {pid} ({parent['model']}/{parent['effort']}). Prior evidence: brief "
-                   f"{d / 'brief.md'}, progress {d / 'progress.md'}, result {d / 'result.md'} (some may not "
-                   "exist). Read them first and do not repeat completed work.\n\n" + (args.context or ""))
+        context = (
+            f"Escalated from task {pid} ({parent['model']}/{parent['effort']}). Prior evidence: brief "
+            f"{d / 'brief.md'}, progress {d / 'progress.md'}, result {d / 'result.md'} (some may not "
+            "exist). Read them first and do not repeat completed work.\n\n" + (args.context or "")
+        )
         task = {
-            "id": tid, "seq": seq, "title": f"Escalation for {pid}", "initiative": parent.get("initiative"),
-            "objective": args.question, "acceptance": args.accept or [
+            "id": tid,
+            "seq": seq,
+            "title": f"Escalation for {pid}",
+            "initiative": parent.get("initiative"),
+            "objective": args.question,
+            "acceptance": args.accept
+            or [
                 "A direct answer to the question with supporting evidence (file:line, command output)",
-                "Explicit confidence and what would change the conclusion"],
-            "context": context, "constraints": ["Read-only analysis: do not modify any repository."],
-            "validation": [], "brief_extra": "", "repos": repos, "paths": [], "depends_on": [],
+                "Explicit confidence and what would change the conclusion",
+            ],
+            "context": context,
+            "constraints": ["Read-only analysis: do not modify any repository."],
+            "validation": [],
+            "brief_extra": "",
+            "repos": repos,
+            "paths": [],
+            "depends_on": [],
             "permission_mode": parent.get("permission_mode"),
             "port_base": policy["port_base"] + (seq % 1000) * policy["port_block"],
-            "escalation_of": pid, "escalations": [], "worker": None, "worker_history": [],
-            "validation_evidence": [], "created": now_iso(), "tier": sel["tier"], "model": sel["model"],
-            "effort": sel["effort"], "model_source": sel["source"],
+            "escalation_of": pid,
+            "escalations": [],
+            "worker": None,
+            "worker_history": [],
+            "validation_evidence": [],
+            "created": now_iso(),
+            "tier": sel["tier"],
+            "model": sel["model"],
+            "effort": sel["effort"],
+            "model_source": sel["source"],
         }
         set_state(task, "planned", f"escalation of {pid}")
         reg["tasks"][tid] = task
-        parent["escalations"].append({"ts": now_iso(), "from": (parent["model"], parent["effort"]),
-                                      "to": (sel["model"], sel["effort"]), "child": tid,
-                                      "reason": args.question})
+        parent["escalations"].append(
+            {
+                "ts": now_iso(),
+                "from": (parent["model"], parent["effort"]),
+                "to": (sel["model"], sel["effort"]),
+                "child": tid,
+                "reason": args.question,
+            }
+        )
     task_dir(tid).mkdir(parents=True, exist_ok=True)
     log_event("escalated", pid, args.question, child=tid)
     print(f"{tid}: escalation of {pid} -> {sel['model']}/{sel['effort']}. Launch with `coord launch {tid}`.")
@@ -1021,8 +1242,20 @@ def cmd_prompt(args: argparse.Namespace) -> None:
     task = get_task(reg, args.task)
     if not task.get("worker"):
         raise CoordError(f"{task['id']} has no worker")
-    herdr("agent", "prompt", task["worker"]["pane_id"], args.text, "--wait", "--until", "working",
-          "--until", "blocked", "--timeout", "30000", timeout=60)
+    herdr(
+        "agent",
+        "prompt",
+        task["worker"]["pane_id"],
+        args.text,
+        "--wait",
+        "--until",
+        "working",
+        "--until",
+        "blocked",
+        "--timeout",
+        "30000",
+        timeout=60,
+    )
     with registry_edit() as reg:
         t = reg["tasks"][task["id"]]
         t.setdefault("redirects", []).append({"ts": now_iso(), "text": args.text})
@@ -1059,8 +1292,13 @@ def cmd_report(args: argparse.Namespace) -> None:
         raise CoordError(f"no task directory {d}")
     with locked(d / ".status.lock"):
         cur = read_json(d / "status.json", {}) or {}
-        rec = {"task": tid, "state": args.state, "summary": args.summary, "ts": now_iso(),
-               "seq": int(cur.get("seq", 0)) + 1}
+        rec = {
+            "task": tid,
+            "state": args.state,
+            "summary": args.summary,
+            "ts": now_iso(),
+            "seq": int(cur.get("seq", 0)) + 1,
+        }
         atomic_write(d / "status.json", json.dumps(rec, indent=2) + "\n")
         with open(d / "progress.md", "a") as fh:
             fh.write(f"- {rec['ts']} [{args.state}] {args.summary}\n")
@@ -1088,9 +1326,19 @@ def cmd_status(args: argparse.Namespace) -> None:
         if obs.get("effort"):
             effort += " ✓" if obs["effort"] == task["effort"] else f" ≠{obs['effort']}!"
         repos = ",".join(r["repo"] + ("" if r["mode"] == "edit" else "(ro)") for r in task["repos"])
-        rows.append([tid, repos, worker.get("agent_name", "-") + (f"@{worker['pane_id']}" if worker else ""),
-                     model, effort, task["state"], live, report.get("state", "-"),
-                     next_action(reg, task, live, report)])
+        rows.append(
+            [
+                tid,
+                repos,
+                worker.get("agent_name", "-") + (f"@{worker['pane_id']}" if worker else ""),
+                model,
+                effort,
+                task["state"],
+                live,
+                report.get("state", "-"),
+                next_action(reg, task, live, report),
+            ]
+        )
     if args.json:
         keys = ["task", "repos", "worker", "model", "effort", "state", "live", "report", "next"]
         print(json.dumps([dict(zip(keys, r, strict=False)) for r in rows], indent=2))
@@ -1098,10 +1346,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     coord = reg.get("coordinator") or {}
     if coord.get("session_id"):
         o = observe_session(coord["session_id"])
-        print(f"coordinator: session {coord['session_id']} pane {coord.get('pane_id')} "
-              f"model {o.get('model')} effort {o.get('effort')} advisor {o.get('advisor') or 'off'}")
-    print(f"watcher: {'running pid ' + str(watcher_pid()) if watcher_pid() else 'STOPPED'}   "
-          f"unread notifications: {len(unread_inbox())}")
+        print(
+            f"coordinator: session {coord['session_id']} pane {coord.get('pane_id')} "
+            f"model {o.get('model')} effort {o.get('effort')} advisor {o.get('advisor') or 'off'}"
+        )
+    print(
+        f"watcher: {'running pid ' + str(watcher_pid()) if watcher_pid() else 'STOPPED'}   "
+        f"unread notifications: {len(unread_inbox())}"
+    )
     if not rows:
         print("no active tasks")
         return
@@ -1118,15 +1370,19 @@ def cmd_show(args: argparse.Namespace) -> None:
     d = task_dir(tid)
     worker = task.get("worker") or {}
     live, _ = live_state(task, live_agents()) if worker else ("none", None)
-    print(f"# {tid}: {task['title']}\nstate={task['state']} live={live} tier={task['tier']} "
-          f"requested={task['model']}/{task['effort']} ({task['model_source']})")
+    print(
+        f"# {tid}: {task['title']}\nstate={task['state']} live={live} tier={task['tier']} "
+        f"requested={task['model']}/{task['effort']} ({task['model_source']})"
+    )
     if task.get("escalation_of"):
         print(f"escalation of: {task['escalation_of']}")
     if worker:
         obs = observe_session(worker.get("session_id"))
-        print(f"worker: {worker['agent_name']} pane={worker['pane_id']} session={worker.get('session_id')} "
-              f"status={worker.get('status')}\nobserved: model={obs['model']} effort={obs['effort']} "
-              f"advisor={obs['advisor'] or 'off'} turns={obs['turns']} usage={obs['usage']}")
+        print(
+            f"worker: {worker['agent_name']} pane={worker['pane_id']} session={worker.get('session_id')} "
+            f"status={worker.get('status')}\nobserved: model={obs['model']} effort={obs['effort']} "
+            f"advisor={obs['advisor'] or 'off'} turns={obs['turns']} usage={obs['usage']}"
+        )
         if len(task["worker_history"]):
             prev = [(w["agent_name"], w.get("session_id"), w["model"], w["effort"]) for w in task["worker_history"]]
             print(f"previous workers: {prev}")
@@ -1160,8 +1416,18 @@ def cmd_peek(args: argparse.Namespace) -> None:
     task = get_task(load_registry(), args.task)
     if not task.get("worker"):
         raise CoordError("no worker")
-    print(herdr("pane", "read", task["worker"]["pane_id"], "--source", "recent-unwrapped",
-                "--lines", str(args.lines), raw=True))
+    print(
+        herdr(
+            "pane",
+            "read",
+            task["worker"]["pane_id"],
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            str(args.lines),
+            raw=True,
+        )
+    )
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -1177,15 +1443,20 @@ def cmd_verify(args: argparse.Namespace) -> None:
         obs = observe_session(w.get("session_id") or herdr_sid)
         ok_model = obs["model"] == task["model"] if obs["model"] else None
         ok_effort = obs["effort"] == task["effort"] if obs["effort"] else None
-        verdict = "UNVERIFIED (no turn yet)" if ok_model is None else (
-            "OK" if ok_model and ok_effort else "MISMATCH")
-        print(f"{tid}: requested {task['model']}/{task['effort']} | observed {obs['model']}/{obs['effort']} "
-              f"advisor={obs['advisor'] or 'off'} | session recorded={w.get('session_id')} herdr={herdr_sid} "
-              f"-> {verdict}")
+        verdict = "UNVERIFIED (no turn yet)" if ok_model is None else ("OK" if ok_model and ok_effort else "MISMATCH")
+        print(
+            f"{tid}: requested {task['model']}/{task['effort']} | observed {obs['model']}/{obs['effort']} "
+            f"advisor={obs['advisor'] or 'off'} | session recorded={w.get('session_id')} herdr={herdr_sid} "
+            f"-> {verdict}"
+        )
         if obs["model"]:
             with registry_edit() as r2:
-                r2["tasks"][tid]["worker"]["observed"] = {"model": obs["model"], "effort": obs["effort"],
-                                                          "advisor": obs["advisor"], "checked": now_iso()}
+                r2["tasks"][tid]["worker"]["observed"] = {
+                    "model": obs["model"],
+                    "effort": obs["effort"],
+                    "advisor": obs["advisor"],
+                    "checked": now_iso(),
+                }
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
@@ -1212,6 +1483,7 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
 
 
 # ----------------------------------------------------------------- watcher
+
 
 def launched_age(worker: dict) -> float:
     try:
@@ -1284,18 +1556,32 @@ class Watcher:
             if report and report.get("seq", 0) > ts["report_seq"]:
                 ts["report_seq"] = report["seq"]
                 ts["turn_reported"] = report["state"] != "running"
-                self.notify(tid, f"report:{report['seq']}", report["state"],
-                            f"{report['state']}: {report.get('summary', '')}")
+                self.notify(
+                    tid, f"report:{report['seq']}", report["state"], f"{report['state']}: {report.get('summary', '')}"
+                )
             live, seq = live_state(task, agents)
             prev = ts.get("live")
             if live != prev:
-                append_line(HOME / "events.jsonl", {"ts": now_iso(), "source": "watcher", "kind": "observe",
-                                                    "task": tid, "text": f"{prev} -> {live}", "seq": seq})
+                append_line(
+                    HOME / "events.jsonl",
+                    {
+                        "ts": now_iso(),
+                        "source": "watcher",
+                        "kind": "observe",
+                        "task": tid,
+                        "text": f"{prev} -> {live}",
+                        "seq": seq,
+                    },
+                )
                 ts["live"] = live
                 if live == "blocked":
-                    self.notify(tid, f"blocked:{seq}", "blocked_dialog",
-                                "worker is at an approval/question dialog; inspect with coord peek "
-                                "(the watcher never answers dialogs)")
+                    self.notify(
+                        tid,
+                        f"blocked:{seq}",
+                        "blocked_dialog",
+                        "worker is at an approval/question dialog; inspect with coord peek "
+                        "(the watcher never answers dialogs)",
+                    )
                 elif live in ("exited", "gone", "replaced"):
                     self.notify(tid, f"exit:{wkey}", "exited", f"worker {live} without being cancelled")
                 elif live in ("idle", "done") and worker.get("prompted"):
@@ -1306,14 +1592,23 @@ class Watcher:
                 ts["idle_since"] = None
                 if not ts.get("turn_reported"):
                     ts["turn_reported"] = True
-                    self.notify(tid, f"idle:{ts.get('idle_seq')}", "idle_no_report",
-                                "turn ended without a final report (completion candidate, not success)")
+                    self.notify(
+                        tid,
+                        f"idle:{ts.get('idle_seq')}",
+                        "idle_no_report",
+                        "turn ended without a final report (completion candidate, not success)",
+                    )
         self.save()
 
     def active_panes(self) -> tuple[str, ...]:
         reg = load_registry()
-        return tuple(sorted(t["worker"]["pane_id"] for t in reg["tasks"].values()
-                            if t.get("worker") and t["state"] not in TERMINAL_STATES))
+        return tuple(
+            sorted(
+                t["worker"]["pane_id"]
+                for t in reg["tasks"].values()
+                if t.get("worker") and t["state"] not in TERMINAL_STATES
+            )
+        )
 
     def subscribe(self, panes: tuple[str, ...]) -> None:
         self.close_sub()
@@ -1323,8 +1618,12 @@ class Watcher:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect(path)
-        s.sendall((json.dumps({"id": "coord-watch", "method": "events.subscribe",
-                               "params": {"subscriptions": subs}}) + "\n").encode())
+        s.sendall(
+            (
+                json.dumps({"id": "coord-watch", "method": "events.subscribe", "params": {"subscriptions": subs}})
+                + "\n"
+            ).encode()
+        )
         first = s.makefile("r").readline()
         ack = json.loads(first) if first else {}
         if "error" in ack or not first:
@@ -1399,9 +1698,14 @@ def cmd_watch(args: argparse.Namespace) -> None:
             print(f"watcher already running (pid {pid})")
             return
         with open(HOME / "watcher.log", "a") as log:
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch", "run"],
-                             stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
-                             env={**os.environ, "COORD_HOME": str(HOME)})
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "watch", "run"],
+                stdout=log,
+                stderr=log,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env={**os.environ, "COORD_HOME": str(HOME)},
+            )
         for _ in range(20):
             time.sleep(0.25)
             if watcher_pid():
@@ -1429,6 +1733,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
 # ------------------------------------------------------------------- inbox
 
+
 def inbox_cursor() -> int:
     try:
         return int((HOME / "inbox.cursor").read_text().strip() or 0)
@@ -1445,7 +1750,7 @@ def cmd_inbox(args: argparse.Namespace) -> None:
     """Print unread notifications; with --wait, block until one arrives (used to wake the coordinator)."""
     guard_not_worker()
     if args.all:
-        entries = read_jsonl(HOME / "inbox.jsonl")[-args.limit:]
+        entries = read_jsonl(HOME / "inbox.jsonl")[-args.limit :]
     elif args.wait:
         with locked(HOME / "inbox.wait.lock", blocking=False):
             deadline = time.time() + args.timeout if args.timeout else None
@@ -1507,6 +1812,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
 # --------------------------------------------------------------------- cli
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="coord", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1565,8 +1871,9 @@ def build_parser() -> argparse.ArgumentParser:
     ts.add_argument("--model")
     ts.add_argument("--effort")
     ts.add_argument("--reason")
-    ts.add_argument("--read-path", action="append",
-                    help="REPO=PATH for a read-only repo (e.g. another task's worktree)")
+    ts.add_argument(
+        "--read-path", action="append", help="REPO=PATH for a read-only repo (e.g. another task's worktree)"
+    )
     ts.set_defaults(fn=cmd_task_set)
 
     la = sub.add_parser("launch", help="start a worker for a planned task")
