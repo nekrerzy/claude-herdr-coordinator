@@ -2,3 +2,5 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+# personal repo notes belong in $COORD_HOME/repo-notes; never commit them
+repo-notes/

@@ -3,7 +3,7 @@ name = "coord"
 version = "0.1.0"
 description = "Coordinator/worker workflow over Herdr and Claude Code"
 requires-python = ">=3.12"
-dependencies = []  # runtime is stdlib-only (bin/coord runs on /usr/bin/python3)
+dependencies = []  # runtime is stdlib-only (bin/coord runs on any python3 >= 3.12)
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.14"]

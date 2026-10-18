@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """coord: a small coordinator/worker toolkit over Herdr and Claude Code.
 
 State lives in $COORD_HOME (default ~/.local/share/coord). The coordinator owns
@@ -17,6 +17,7 @@ import os
 import re
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -33,7 +34,14 @@ from typing import Any
 TOOL_DIR = Path(__file__).resolve().parent.parent
 HOME = Path(os.environ.get("COORD_HOME", "~/.local/share/coord")).expanduser()
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
-CLAUDE_PROJECTS = Path("~/.claude/projects").expanduser()
+CLAUDE_PROJECTS = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects"
+MIN_PYTHON = (3, 12)
+PREREQS = {  # name: (version command, minimum version (oldest verified), purpose, required)
+    "git": (["git", "--version"], (2, 28), "worktrees", True),
+    "herdr": ([HERDR, "--version"], (0, 9, 1), "panes, agents and events", True),
+    "claude": (["claude", "--version"], (2, 1, 300), "coordinator and workers", True),
+    "uv": (["uv", "--version"], (0, 5), "tests only (uv run pytest)", False),
+}
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KNOWN_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5")
@@ -83,7 +91,7 @@ DEFAULT_POLICY: dict[str, Any] = {
         "exceptional": {"model": "claude-fable-5-1", "effort": "high"},
     },
     "advisor": "disabled",
-    "worktree_root": "~/Projects/.coord-worktrees",
+    "worktree_root": None,  # None: $COORD_HOME/worktrees (env COORD_WORKTREE_ROOT overrides)
     "agent_prefix": "w",
     "workers_tab_label": "coord-workers",
     "port_base": 20000,
@@ -198,6 +206,11 @@ def load_policy() -> dict:
     return policy
 
 
+def worktree_root(policy: dict) -> Path:
+    """COORD_WORKTREE_ROOT, else policy worktree_root, else $COORD_HOME/worktrees."""
+    return Path(os.environ.get("COORD_WORKTREE_ROOT") or policy.get("worktree_root") or HOME / "worktrees").expanduser()
+
+
 def resolve_model(policy: dict, tier: str, model: str | None, effort: str | None) -> dict:
     """Resolve tier defaults plus explicit overrides; reject unsupported values."""
     if tier not in policy["tiers"]:
@@ -235,6 +248,26 @@ def registry_edit() -> Iterator[dict]:
         reg = load_registry()
         yield reg
         atomic_write(HOME / "registry.json", json.dumps(reg, indent=2) + "\n")
+
+
+def resolve_instruction(path: str) -> str:
+    """Map a missing `.../repo-notes/<file>` (the pre-portable in-repo location) to $COORD_HOME/repo-notes."""
+    p = Path(path)
+    moved = HOME / "repo-notes" / p.name
+    if not p.exists() and p.parent.name == "repo-notes" and moved.exists():
+        return str(moved)
+    return path
+
+
+def migrate_notes(reg: dict) -> list[str]:
+    """Rewrite registry instruction paths whose repo notes moved to $COORD_HOME/repo-notes."""
+    changes = []
+    for repo in reg["repos"].values():
+        new = [resolve_instruction(i) for i in repo.get("instructions", [])]
+        if new != repo.get("instructions", []):
+            repo["instructions"] = new
+            changes.append(f"{repo['name']}: instructions -> {new}")
+    return changes
 
 
 def get_task(reg: dict, task_id: str) -> dict:
@@ -304,6 +337,10 @@ def herdr(*args: Any, timeout: float | None = 120, raw: bool = False) -> Any:
         return json.loads(proc.stdout) if proc.stdout.strip() else {}
     except ValueError:
         raise HerdrError("bad_output", proc.stdout[:200]) from None
+
+
+def herdr_socket() -> Path:
+    return Path(os.environ.get("HERDR_SOCKET_PATH") or "~/.config/herdr/herdr.sock").expanduser()
 
 
 def live_agents() -> dict[str, dict]:
@@ -476,7 +513,7 @@ def render_brief(reg: dict, task: dict, plan: list[dict]) -> str:
         else:
             lines += [f"- **{p['repo']}** (read-only) — `{p['path']}`; do not modify."]
         for ins in repo.get("instructions", []):
-            lines.append(f"  - read repo instructions first: `{ins}`")
+            lines.append(f"  - read repo instructions first: `{resolve_instruction(ins)}`")
     lines += [
         "",
         "## Constraints",
@@ -745,7 +782,7 @@ def cmd_task_set(args: argparse.Namespace) -> None:
 
 
 def plan_repos(reg: dict, task: dict, policy: dict) -> list[dict]:
-    root = Path(policy["worktree_root"]).expanduser()
+    root = worktree_root(policy)
     plan = []
     for r in task["repos"]:
         repo = reg["repos"][r["repo"]]
@@ -1495,9 +1532,13 @@ def launched_age(worker: dict) -> float:
 def watcher_pid() -> int | None:
     try:
         pid = int((HOME / "watcher.pid").read_text().strip())
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
-    except (FileNotFoundError, ValueError, ProcessLookupError):
+    except (FileNotFoundError, ValueError):
         return None
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except FileNotFoundError:  # dead process, or no /proc (macOS)
+        ps = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+        cmdline = "\x00".join(ps.stdout.split())
     return pid if "watch\x00run" in cmdline else None
 
 
@@ -1614,10 +1655,9 @@ class Watcher:
         self.close_sub()
         subs: list[dict] = [{"type": "pane.exited"}, {"type": "pane.closed"}]
         subs += [{"type": "pane.agent_status_changed", "pane_id": p} for p in panes if pane_exists(p)]
-        path = os.environ.get("HERDR_SOCKET_PATH") or str(Path("~/.config/herdr/herdr.sock").expanduser())
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5)
-        s.connect(path)
+        s.connect(str(herdr_socket()))
         s.sendall(
             (
                 json.dumps({"id": "coord-watch", "method": "events.subscribe", "params": {"subscriptions": subs}})
@@ -1783,7 +1823,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     guard_not_worker()
     agents = live_agents()
     with registry_edit() as reg:
-        changes = sync_states(reg, agents)
+        changes = migrate_notes(reg) + sync_states(reg, agents)
     reg = load_registry()
     print("\n".join(changes) or "registry already consistent with live state")
     for tid, task in reg["tasks"].items():
@@ -1808,6 +1848,227 @@ def cmd_resume(args: argparse.Namespace) -> None:
         cmd_watch(argparse.Namespace(action="start"))
     unread = unread_inbox()
     print(f"{len(unread)} unread notification(s); run `coord inbox`")
+
+
+# ------------------------------------------------------- install / doctor
+
+LINKED = ("coord", "coord-coordinator")
+
+
+def fmt_version(v: tuple[int, ...]) -> str:
+    return ".".join(map(str, v))
+
+
+def tool_version(cmd: list[str]) -> tuple[str | None, tuple[int, ...] | None]:
+    """Return (executable path, parsed version) for a prerequisite; (None, None) if it is not on PATH."""
+    exe = shutil.which(cmd[0])
+    if not exe:
+        return None, None
+    try:
+        proc = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return exe, None
+    m = re.search(r"\d+(?:\.\d+)+", proc.stdout + proc.stderr)
+    return exe, tuple(int(x) for x in m.group(0).split(".")) if m else None
+
+
+def check_prereqs() -> list[tuple[str, str, str]]:
+    """(level, name, detail) per prerequisite; level is ok, warn or FAIL."""
+    py = sys.version_info[:3]
+    out = [
+        (
+            "ok" if py >= MIN_PYTHON else "FAIL",
+            "python",
+            f"{fmt_version(py)} {sys.executable} (need >= {fmt_version(MIN_PYTHON)})",
+        )
+    ]
+    for name, (cmd, minimum, purpose, required) in PREREQS.items():
+        bad = "FAIL" if required else "warn"
+        exe, version = tool_version(cmd)
+        if not exe:
+            out.append((bad, name, f"not found on PATH; install it ({purpose}, need >= {fmt_version(minimum)})"))
+        elif version is None:
+            out.append(("warn", name, f"{exe}: version unknown (need >= {fmt_version(minimum)})"))
+        elif version < minimum:
+            out.append((bad, name, f"{fmt_version(version)} at {exe} is older than {fmt_version(minimum)}; upgrade"))
+        else:
+            out.append(("ok", name, f"{fmt_version(version)} {exe}"))
+    return out
+
+
+def check_policy(policy: dict) -> list[tuple[str, str, str]]:
+    out = []
+    roles = {"coordinator": policy.get("coordinator") or {}, **{f"tier {k}": v for k, v in policy["tiers"].items()}}
+    for role, sel in roles.items():
+        model, effort = sel.get("model"), sel.get("effort")
+        known = model in KNOWN_MODELS or model in ("opus", "sonnet", "haiku", "fable")
+        ok = known and effort in EFFORTS
+        out.append(
+            (
+                "ok" if ok else "FAIL",
+                f"policy {role}",
+                f"{model} / {effort}" + ("" if ok else f" (models: {KNOWN_MODELS}; efforts: {EFFORTS})"),
+            )
+        )
+    return out
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """Read-only health check of prerequisites, install, state, registry, watcher and Herdr."""
+    checks = check_prereqs()
+    for name in LINKED:
+        found, target = shutil.which(name), TOOL_DIR / "bin" / name
+        if not found:
+            checks.append(("warn", name, f"not on PATH; run {TOOL_DIR / 'scripts' / 'install.sh'}"))
+        elif Path(found).resolve() != target.resolve():
+            checks.append(("warn", name, f"{found} -> {Path(found).resolve()}, not this clone ({target})"))
+        else:
+            checks.append(("ok", name, f"{found} -> {target}"))
+    policy = None
+    for f in ("policy.json", "registry.json"):
+        try:
+            read_json(HOME / f, {})
+            checks.append(
+                (
+                    "ok" if (HOME / f).exists() else "FAIL",
+                    f,
+                    str(HOME / f) + ("" if (HOME / f).exists() else " missing; run `coord init` or the installer"),
+                )
+            )
+        except ValueError as exc:
+            checks.append(("FAIL", f, f"{HOME / f}: invalid JSON ({exc})"))
+    try:
+        policy = load_policy()
+    except ValueError:
+        pass
+    if policy:
+        checks += check_policy(policy)
+        root = worktree_root(policy)
+        checks.append(("ok", "worktree_root", f"{root}" + ("" if root.is_dir() else " (created on first launch)")))
+    try:
+        repos = load_registry()["repos"]
+    except ValueError:
+        repos = {}
+    for r in repos.values():
+        path = Path(r["path"])
+        is_git = (
+            path.is_dir() and subprocess.run(["git", "-C", str(path), "rev-parse"], capture_output=True).returncode == 0
+        )
+        checks.append(
+            (
+                "ok" if is_git else "FAIL",
+                f"repo {r['name']}",
+                str(path)
+                + (
+                    ""
+                    if is_git
+                    else f": missing or not a git repo; re-register with `coord repo add {r['name']} <path>`"
+                ),
+            )
+        )
+        for ins in r.get("instructions", []):
+            if not Path(resolve_instruction(ins)).exists():
+                checks.append(("warn", f"repo {r['name']}", f"instruction file missing: {ins}"))
+    pid = watcher_pid()
+    checks.append(
+        ("ok", "watcher", f"running pid {pid}")
+        if pid
+        else ("warn", "watcher", "stopped; `coord resume` or `coord watch start` (in a Herdr pane)")
+    )
+    sock = herdr_socket()
+    checks.append(
+        ("ok", "herdr socket", str(sock))
+        if sock.exists()
+        else ("warn", "herdr socket", f"{sock} not found; start Herdr (or set HERDR_SOCKET_PATH)")
+    )
+    checks.append(
+        ("ok", "HERDR_ENV", "inside a Herdr pane")
+        if os.environ.get("HERDR_ENV") == "1"
+        else ("warn", "HERDR_ENV", "not inside a Herdr pane; the coordinator and workers must run in one")
+    )
+    for level, name, detail in checks:
+        print(f"{level:<4}  {name:<22} {detail}")
+    fails = sum(1 for c in checks if c[0] == "FAIL")
+    if fails:
+        raise CoordError(f"doctor: {fails} problem(s) marked FAIL")
+    print(f"COORD_HOME={HOME}  toolkit={TOOL_DIR}")
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    """Link coord into a bin dir and create COORD_HOME; idempotent; --uninstall removes only those links."""
+    bin_dir = Path(args.bin_dir or "~/.local/bin").expanduser()
+    would = "would " if args.dry_run else ""
+    links = {bin_dir / n: (TOOL_DIR / "bin" / n).resolve() for n in LINKED}
+    if args.uninstall:
+        for link, target in links.items():
+            if link.is_symlink() and link.resolve() == target:
+                if not args.dry_run:
+                    link.unlink()
+                print(f"{would}remove {link}")
+            elif link.exists() or link.is_symlink():
+                print(f"keep {link} (not a link to this clone)")
+        print(f"state kept: {HOME} (never removed by the installer)")
+        return
+    checks = check_prereqs()
+    for level, name, detail in checks:
+        print(f"{level:<4}  {name:<8} {detail}")
+    fails = [c[1] for c in checks if c[0] == "FAIL"]
+    if fails and not args.dry_run:
+        raise CoordError(f"missing or outdated prerequisites: {', '.join(fails)}; fix them and re-run")
+    conflicts = [
+        link
+        for link, target in links.items()
+        if (link.exists() or link.is_symlink()) and not (link.is_symlink() and link.resolve() == target)
+    ]
+    for link in conflicts:
+        if not (args.force and link.is_symlink()):
+            raise CoordError(
+                f"{link} exists and is not a link to this clone ({link.resolve()}); "
+                + (
+                    "it is not a symlink, so remove it yourself"
+                    if not link.is_symlink()
+                    else "pass --force to replace it"
+                )
+            )
+    if args.no_sync:
+        print("skip uv sync (--no-sync)")
+    elif not shutil.which("uv"):
+        print("skip uv sync (uv not found; only needed to run the tests)")
+    elif args.dry_run:
+        print(f"would run: uv sync --locked (in {TOOL_DIR})")
+    else:
+        subprocess.run(["uv", "sync", "--locked", "--quiet"], cwd=TOOL_DIR, check=True)
+        print("uv sync --locked: ok")
+    for link, target in links.items():
+        if link not in conflicts and link.is_symlink():
+            print(f"ok    {link} -> {target}")
+            continue
+        if not args.dry_run:
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            link.unlink(missing_ok=True)
+            link.symlink_to(target)
+        print(f"{would}link {link} -> {target}")
+    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f'warning: {bin_dir} is not on PATH; add it to your shell profile: export PATH="{bin_dir}:$PATH"')
+    if args.dry_run:
+        missing = [f for f in ("policy.json", "registry.json") if not (HOME / f).exists()]
+        print(
+            f"would create in COORD_HOME={HOME}: {', '.join(missing)}"
+            if missing
+            else f"COORD_HOME={HOME} (already initialized)"
+        )
+    else:
+        cmd_init(args)
+    print(
+        "\nnext steps:\n"
+        "  coord doctor                        # check the setup\n"
+        "  coord repo add <name> <path>        # register YOUR repositories (each person keeps their own)\n"
+        "  herdr                               # start Herdr, then in a pane:\n"
+        "  coord-coordinator                   # start the coordinator session\n"
+        f"  {TOOL_DIR / 'scripts' / 'demo-setup.sh'}   # optional: a disposable demo"
+    )
+    if os.environ.get("COORD_HOME"):
+        print(f"note: COORD_HOME is set ({HOME}); keep it exported in the shells you run coord from")
 
 
 # --------------------------------------------------------------------- cli
@@ -1977,6 +2238,15 @@ def build_parser() -> argparse.ArgumentParser:
     ib.set_defaults(fn=cmd_inbox)
 
     sub.add_parser("resume", help="reconcile state after a restart").set_defaults(fn=cmd_resume)
+    sub.add_parser("doctor", help="read-only health check of the setup").set_defaults(fn=cmd_doctor)
+
+    inst = sub.add_parser("install", help="link coord into a bin dir and create COORD_HOME (idempotent)")
+    inst.add_argument("--bin-dir", help="where to link coord and coord-coordinator (default ~/.local/bin)")
+    inst.add_argument("--dry-run", action="store_true", help="print what would happen; change nothing")
+    inst.add_argument("--uninstall", action="store_true", help="remove the links to this clone; state is kept")
+    inst.add_argument("--force", action="store_true", help="replace symlinks that point to another clone")
+    inst.add_argument("--no-sync", action="store_true", help="skip `uv sync` (tests only need it)")
+    inst.set_defaults(fn=cmd_install)
     return p
 
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Create disposable demo repos and a separate demo COORD_HOME. Idempotent: existing repos are left alone.
 # Usage: scripts/demo-setup.sh   then   export COORD_HOME=~/.local/share/coord-demo
+# Demo repos and worktrees go in $COORD_DEMO_DIR (default ~/coord-demo).
 set -euo pipefail
-DEMO=~/Projects/.coord-demo
+coord() { python3 "$(dirname "${BASH_SOURCE[0]}")/../bin/coord" "$@"; }
+export DEMO="${COORD_DEMO_DIR:-$HOME/coord-demo}"
 export COORD_HOME=~/.local/share/coord-demo
 mkdir -p "$DEMO/repos"
 
@@ -99,7 +101,7 @@ python3 - <<'EOF'
 import json, os, pathlib
 p = pathlib.Path(os.environ["COORD_HOME"]) / "policy.json"
 pol = json.loads(p.read_text())
-pol.update(agent_prefix="d", workers_tab_label="coord-demo", worktree_root="~/Projects/.coord-demo/worktrees")
+pol.update(agent_prefix="d", workers_tab_label="coord-demo", worktree_root=os.environ["DEMO"] + "/worktrees")
 p.write_text(json.dumps(pol, indent=2) + "\n")
 EOF
 coord repo add mono "$DEMO/repos/mono" --kind monorepo

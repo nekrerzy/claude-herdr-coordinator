@@ -25,6 +25,8 @@ elif args[:2] == ["pane", "get"]:
         print(json.dumps({"result": {"pane": {"pane_id": args[2]}}}))
     else:
         err("pane_not_found")
+elif args == ["--version"]:
+    print("herdr 0.9.1")
 elif args[:2] == ["notification", "show"]:
     print(json.dumps({"result": {"shown": False}}))
 else:
@@ -32,12 +34,17 @@ else:
 """
 
 
-@pytest.fixture
-def coord(tmp_path, monkeypatch):
+def load_coord():
     loader = importlib.machinery.SourceFileLoader("coord_mod", str(ROOT / "bin" / "coord"))
     spec = importlib.util.spec_from_loader("coord_mod", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def coord(tmp_path, monkeypatch):
+    mod = load_coord()
     home = tmp_path / "home"
     fake = tmp_path / "herdr"
     fake.write_text(FAKE_HERDR)
@@ -297,3 +304,140 @@ def test_worker_deny_list_in_launch_command(coord, capsys):
     cmd = json.loads(capsys.readouterr().out)["command"]
     deny = cmd[cmd.index("--disallowedTools") + 1]
     assert "Bash(coord launch *)" in deny and "Bash(herdr *)" in deny and "registry.json" in deny
+
+
+def make_fakebin(path: Path, claude="2.1.302 (Claude Code)", herdr="herdr 0.9.1", uv="uv 0.12.5") -> Path:
+    path.mkdir()
+    for name, version in (("claude", claude), ("herdr", herdr), ("uv", uv)):
+        if version:
+            (path / name).write_text(f"#!/bin/sh\necho '{version}'\n")
+            (path / name).chmod(0o755)
+    return path
+
+
+def test_moved_repo_notes_resolve_and_resume_migrates(coord, monkeypatch, capsys):
+    repo = make_repo(coord.tmp / "repo")
+    kept = coord.tmp / "kept-notes" / "repo-notes" / "kept.md"
+    kept.parent.mkdir(parents=True)
+    kept.write_text("still here\n")
+    old = coord.tmp / "old-clone" / "repo-notes" / "secret.md"  # pre-portable path; the file is gone
+    (coord.HOME / "repo-notes").mkdir()
+    (coord.HOME / "repo-notes" / "secret.md").write_text("rules\n")
+    run(coord, "repo", "add", "r", str(repo), "--instructions", str(old), "--instructions", str(kept))
+    run(coord, "task", "add", "--title", "x", "--repo", "r")
+    reg = coord.load_registry()
+    brief = coord.render_brief(reg, reg["tasks"]["t001-x"], coord.plan_repos(reg, reg["tasks"]["t001-x"], {}))
+    assert str(coord.HOME / "repo-notes" / "secret.md") in brief and str(old) not in brief
+    monkeypatch.setattr(coord, "watcher_pid", lambda: 4242)  # do not start a real watcher
+    run(coord, "resume")
+    assert "r: instructions ->" in capsys.readouterr().out
+    instructions = coord.load_registry()["repos"]["r"]["instructions"]
+    assert instructions[-2:] == [str(coord.HOME / "repo-notes" / "secret.md"), str(kept)]
+    run(coord, "resume")  # idempotent
+    assert "instructions ->" not in capsys.readouterr().out
+
+
+def test_worktree_root_and_claude_dir_overrides(coord, monkeypatch, tmp_path):
+    monkeypatch.delenv("COORD_WORKTREE_ROOT", raising=False)
+    assert coord.worktree_root({"worktree_root": None}) == coord.HOME / "worktrees"
+    assert coord.worktree_root({"worktree_root": "~/wt"}) == Path("~/wt").expanduser()
+    monkeypatch.setenv("COORD_WORKTREE_ROOT", str(tmp_path / "env-wt"))
+    assert coord.worktree_root({"worktree_root": "~/wt"}) == tmp_path / "env-wt"
+    assert coord.DEFAULT_POLICY["worktree_root"] is None  # no user path baked into the default
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-cfg"))
+    monkeypatch.setenv("COORD_HOME", str(tmp_path / "ch"))
+    fresh = load_coord()
+    assert fresh.CLAUDE_PROJECTS == tmp_path / "claude-cfg" / "projects"
+    assert fresh.HOME == tmp_path / "ch"
+
+
+def test_doctor_with_fakes(coord, monkeypatch, capsys):
+    fakebin = make_fakebin(coord.tmp / "fakebin")
+    git_dir = str(Path(subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()).parent)
+    monkeypatch.setenv("PATH", f"{fakebin}:{git_dir}")
+    monkeypatch.setitem(coord.PREREQS, "herdr", ([coord.HERDR, "--version"], (0, 9, 1), "panes", True))
+    sock = coord.tmp / "herdr.sock"
+    sock.touch()
+    monkeypatch.setenv("HERDR_SOCKET_PATH", str(sock))
+    run(coord, "repo", "add", "good", str(make_repo(coord.tmp / "good")))
+    gone = make_repo(coord.tmp / "gone")
+    run(coord, "repo", "add", "gone", str(gone))
+    subprocess.run(["rm", "-rf", str(gone)], check=True)
+    capsys.readouterr()
+    assert coord.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  repo gone" in out and "ok    repo good" in out
+    assert "ok    claude" in out and "ok    herdr" in out and "ok    herdr socket" in out
+    assert "warn  watcher" in out and "ok    policy tier complex" in out
+    with coord.registry_edit() as reg:
+        del reg["repos"]["gone"]
+    run(coord, "doctor")
+    (fakebin / "claude").write_text("#!/bin/sh\necho '2.0.1 (Claude Code)'\n")
+    coord.atomic_write(coord.HOME / "policy.json", json.dumps({"tiers": {"routine": {"model": "gpt-x"}}}))
+    capsys.readouterr()
+    assert coord.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL  claude" in out and "older than 2.1.300" in out and "FAIL  policy tier routine" in out
+
+
+def install_env(tmp_path: Path) -> dict:
+    fakebin = tmp_path / "fakebin"
+    if not fakebin.exists():
+        make_fakebin(fakebin)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COORD_", "HERDR_", "CLAUDE_CONFIG"))}
+    env.update(HOME=str(tmp_path / "fakehome"), PATH=f"{fakebin}:{os.environ['PATH']}")
+    return env
+
+
+def install(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(ROOT / "scripts" / "install.sh"), *args], capture_output=True, text=True, env=install_env(tmp_path)
+    )
+
+
+def test_installer_dry_run_touches_nothing(tmp_path):
+    (tmp_path / "fakehome").mkdir()
+    out = install(tmp_path, "--dry-run")
+    assert out.returncode == 0, out.stderr
+    fakehome = tmp_path / "fakehome"
+    assert f"would link {fakehome}/.local/bin/coord -> {ROOT}/bin/coord" in out.stdout
+    assert "would create in COORD_HOME=" in out.stdout and "is not on PATH" in out.stdout
+    assert list(fakehome.iterdir()) == []
+
+
+def test_installer_is_idempotent_and_uninstall_keeps_state(tmp_path):
+    fakehome = tmp_path / "fakehome"
+    fakehome.mkdir()
+    out = install(tmp_path, "--no-sync")
+    assert out.returncode == 0, out.stdout + out.stderr
+    link = fakehome / ".local" / "bin" / "coord"
+    assert link.resolve() == (ROOT / "bin" / "coord").resolve()
+    policy = fakehome / ".local" / "share" / "coord" / "policy.json"
+    assert json.loads(policy.read_text())["max_active_workers"] == 3
+    policy.write_text('{"max_active_workers": 1}\n')  # user edits survive a re-install
+    out = install(tmp_path, "--no-sync")
+    assert out.returncode == 0 and f"ok    {link}" in out.stdout and "already initialized" in out.stdout
+    assert policy.read_text() == '{"max_active_workers": 1}\n'
+    other = fakehome / ".local" / "bin" / "coord-coordinator"
+    other.unlink()
+    other.symlink_to(tmp_path / "another-clone")
+    out = install(tmp_path, "--no-sync")
+    assert out.returncode == 1 and "pass --force" in out.stderr
+    assert install(tmp_path, "--no-sync", "--force").returncode == 0
+    out = install(tmp_path, "--uninstall")
+    assert out.returncode == 0 and not link.exists() and not other.is_symlink()
+    assert policy.exists()  # state is never removed
+
+
+def test_installer_refuses_missing_prerequisite(tmp_path):
+    (tmp_path / "fakehome").mkdir()
+    fakebin = make_fakebin(tmp_path / "fakebin", claude=None)
+    env = install_env(tmp_path)
+    env["PATH"] = f"{fakebin}:" + ":".join(
+        d for d in os.environ["PATH"].split(":") if not (Path(d) / "claude").exists()
+    )
+    out = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "install.sh"), "--no-sync"], capture_output=True, text=True, env=env
+    )
+    assert out.returncode == 1 and "FAIL  claude" in out.stdout and "claude" in out.stderr
+    assert not (tmp_path / "fakehome" / ".local").exists()
