@@ -1,7 +1,8 @@
 # Operating guide: Herdr coordinator + Claude workers
 
-Toolkit: `~/Projects/local/AI-PRO` (`coord` and `coord-coordinator` are symlinked into `~/.local/bin`).
+Toolkit: wherever you cloned it; `scripts/install.sh` links `coord` and `coord-coordinator` into `~/.local/bin` (see `README.md`).
 State: `~/.local/share/coord` (override with `COORD_HOME`; the demo uses `~/.local/share/coord-demo`).
+Health check: `coord doctor` (read-only: prerequisites, links, policy, registered repos, watcher, Herdr socket).
 
 ## Start the coordinator (Opus 5.5, medium effort)
 In a Herdr pane (`HERDR_ENV=1`):
@@ -16,8 +17,9 @@ In a new coordinator session, the coordinator runs `coord coordinator`, `coord r
 
 ## Register repositories and plan work
 ```bash
-coord repo add api ~/Projects/acme/api                   # lockfiles become shared paths; CLAUDE.md/AGENTS.md recorded
-coord repo add mono ~/Projects/acme/mono --kind monorepo --shared packages/contracts
+coord repo add api ~/src/api                             # lockfiles become shared paths; CLAUDE.md/AGENTS.md recorded
+coord repo add mono ~/src/mono --kind monorepo --shared packages/contracts
+coord repo add infra ~/src/infra --instructions $COORD_HOME/repo-notes/infra.md   # personal repo notes
 coord initiative add rename --title "..." --repos api web --order api,web --interface "GET /u returns display_name"
 coord task add --title "..." --repo mono --paths packages/a --objective "..." \
   --accept "..." --validate "pytest packages/a"          # routine tier by default
@@ -26,6 +28,7 @@ coord task add --title "..." --repo web --repo api:read --depends-on t003 ...
 coord task add --title "survey X" --repo api --readonly  # research; shares the checkout
 coord launch <task> [--dry-run]                           # worktree + pane + worker + kickoff
 ```
+Repo notes (extra per-repo rules such as access limits) are personal: keep them in `$COORD_HOME/repo-notes/`, never in the toolkit repo; `examples/repo-notes.example.md` shows the format.
 `launch` refuses: a duplicate live worker, unmet dependencies, more than 3 active workers, overlapping paths in the same repo, or calls from a worker.
 
 ## Status and inspection
@@ -69,6 +72,7 @@ coord cleanup <task> --yes              # remove finished worktrees (refuses if 
 ```bash
 coord watch start|stop|status|log   # daemon; pid in $COORD_HOME/watcher.pid; log in the coord-workers tab
 coord resume                        # reconcile registry vs panes, Git, result files; starts the watcher if stopped
+                                    # also rewrites registry paths to repo notes moved to $COORD_HOME/repo-notes
 ```
 The watcher subscribes to Herdr events and re-reads state every 10 s as a fallback. It writes `events.jsonl` and `inbox.jsonl` and shows Herdr toasts. It never types into a pane. Restarting it does not repeat notifications, and completions it missed while stopped are reported once.
 
@@ -76,7 +80,7 @@ The watcher subscribes to Herdr events and re-reads state every 10 s as a fallba
 Claude Code asks once per **repository** (worktrees inherit the main repo's trust). A worker of a not-yet-trusted repo stops at the dialog: `coord launch` reports it, the watcher notifies, and **you** accept it in the worker pane, then run `coord kick <task>`. coord never answers that dialog.
 
 ## Files
-`$COORD_HOME/registry.json` (coordinator-owned), `policy.json`, `tasks/<id>/{brief.md,progress.md,result.md,status.json,tmp/}`, `events.jsonl`, `inbox.jsonl`, `watcher.log`. Worktrees: `~/Projects/.coord-worktrees/<repo>/<task>` on branch `coord/<task>`. Worktrees isolate files only; they are not a security sandbox.
+`$COORD_HOME/registry.json` (coordinator-owned), `policy.json`, `tasks/<id>/{brief.md,progress.md,result.md,status.json,tmp/}`, `events.jsonl`, `inbox.jsonl`, `watcher.log`. Worktrees: `<worktree_root>/<repo>/<task>` on branch `coord/<task>`; `worktree_root` is `COORD_WORKTREE_ROOT`, else `policy.json`, else `$COORD_HOME/worktrees`. Worktrees isolate files only; they are not a security sandbox.
 
 ## Demo
-`scripts/demo-setup.sh` creates disposable repos (`~/Projects/.coord-demo`) and `COORD_HOME=~/.local/share/coord-demo`. Remove the demo when done (after `coord watch stop` with that COORD_HOME): close the `coord-demo` Herdr tab, then delete `~/Projects/.coord-demo` and `~/.local/share/coord-demo`.
+`scripts/demo-setup.sh` creates disposable repos in `$COORD_DEMO_DIR` (default `~/coord-demo`) and `COORD_HOME=~/.local/share/coord-demo`. Remove the demo when done (after `coord watch stop` with that COORD_HOME): close the `coord-demo` Herdr tab, then delete the demo dir and `~/.local/share/coord-demo`.

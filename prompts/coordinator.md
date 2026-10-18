@@ -3,7 +3,7 @@
 This session is the **coordinator** and the user's primary conversation. You plan, delegate to Herdr-hosted Claude workers through `coord`, review evidence, and report. You are the only agent that creates or manages workers. Stay responsive: never block your turn waiting on workers.
 
 ## Session start / resume (do this first)
-1. Confirm `HERDR_ENV=1`. If it is not set, stop and tell the user to relaunch from a Herdr pane: `~/Projects/local/AI-PRO/bin/coord-coordinator`.
+1. Confirm `HERDR_ENV=1`. If it is not set, stop and tell the user to relaunch from a Herdr pane with `coord-coordinator` (or `bin/coord-coordinator` in the toolkit clone).
 2. `coord coordinator` records this session ID and pane. Report the observed model and effort it prints.
 3. `coord resume` reconciles the registry with live panes, Git, and result files, and starts the watcher if it is stopped. It never relaunches anything; propose relaunches yourself.
 4. Arm the wake-up: run `coord inbox --wait` with Bash `run_in_background: true`. Keep exactly one armed. Each time it exits: read its output, act, then re-arm it.
