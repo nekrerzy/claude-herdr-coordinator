@@ -1,0 +1,1687 @@
+#!/usr/bin/python3
+"""coord: a small coordinator/worker toolkit over Herdr and Claude Code.
+
+State lives in $COORD_HOME (default ~/.local/share/coord). The coordinator owns
+registry.json; each worker writes only its own tasks/<id>/ files via
+`coord report`. The watcher (`coord watch`) is deterministic: it reads Herdr
+state and worker reports and appends notifications to inbox.jsonl.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+TOOL_DIR = Path(__file__).resolve().parent.parent
+HOME = Path(os.environ.get("COORD_HOME", "~/.local/share/coord")).expanduser()
+HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+CLAUDE_PROJECTS = Path("~/.claude/projects").expanduser()
+
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+KNOWN_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5")
+TASK_STATES = ("planned", "running", "blocked", "ready_for_review", "validated", "failed", "cancelled")
+TERMINAL_STATES = ("validated", "cancelled")
+ACTIVE_STATES = ("running", "blocked", "ready_for_review")
+REPORT_STATES = ("running", "blocked", "ready_for_review", "failed")
+AGENT_LIVE = ("working", "idle", "done", "blocked", "unknown")
+LOCKFILES = {
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "uv.lock", "poetry.lock",
+    "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock", "flake.lock",
+}
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+WORKER_DENY = ["Bash(coord launch *)", "Bash(coord relaunch *)", "Bash(coord kick *)", "Bash(coord cancel *)",
+               "Bash(coord close *)", "Bash(coord escalate *)", "Bash(coord prompt *)", "Bash(coord set *)",
+               "Bash(coord task *)", "Bash(coord repo *)", "Bash(coord cleanup *)", "Bash(coord watch *)",
+               "Bash(herdr *)"]
+TOAST_KINDS = {"blocked", "blocked_dialog", "ready_for_review", "failed", "exited", "idle_no_report"}
+
+DEFAULT_POLICY: dict[str, Any] = {
+    "max_active_workers": 3,
+    "coordinator": {"model": "claude-opus-5-5", "effort": "medium"},
+    "tiers": {
+        "routine": {"model": "claude-sonnet-5-5", "effort": "medium"},
+        "complex": {"model": "claude-opus-5-5", "effort": "high"},
+        "exceptional": {"model": "claude-fable-5-1", "effort": "high"},
+    },
+    "advisor": "disabled",
+    "worktree_root": "~/Projects/.coord-worktrees",
+    "agent_prefix": "w",
+    "workers_tab_label": "coord-workers",
+    "port_base": 20000,
+    "port_block": 10,
+    "default_permission_mode": None,
+    "watch": {"poll_seconds": 10, "idle_confirm_seconds": 4, "toast": True},
+}
+
+
+class CoordError(Exception):
+    """A user-facing error; printed without a traceback."""
+
+
+class HerdrError(CoordError):
+    """A Herdr CLI error carrying the server's error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"herdr {code}: {message}")
+        self.code = code
+
+
+# ---------------------------------------------------------------- utilities
+
+def now_iso() -> str:
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def append_line(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fh.write(json.dumps(obj) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+@contextmanager
+def locked(path: Path, blocking: bool = True) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise CoordError(f"lock busy: {path}") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def check_id(kind: str, value: str) -> str:
+    if not ID_RE.match(value or ""):
+        raise CoordError(f"invalid {kind} id {value!r}: use lowercase letters, digits and '-' (max 48)")
+    return value
+
+
+def slugify(text: str, limit: int = 20) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:limit].rstrip("-") or "task"
+
+
+def short_model(model: str | None) -> str:
+    return (model or "-").removeprefix("claude-")
+
+
+# ------------------------------------------------------------------ policy
+
+def load_policy() -> dict:
+    policy = json.loads(json.dumps(DEFAULT_POLICY))
+    user = read_json(HOME / "policy.json", {}) or {}
+    for key, value in user.items():
+        if isinstance(value, dict) and isinstance(policy.get(key), dict):
+            policy[key].update(value)
+        else:
+            policy[key] = value
+    return policy
+
+
+def resolve_model(policy: dict, tier: str, model: str | None, effort: str | None) -> dict:
+    """Resolve tier defaults plus explicit overrides; reject unsupported values."""
+    if tier not in policy["tiers"]:
+        raise CoordError(f"unknown tier {tier!r}; choose from {sorted(policy['tiers'])}")
+    base = policy["tiers"][tier]
+    chosen_model = model or base["model"]
+    chosen_effort = effort or base["effort"]
+    if chosen_effort not in EFFORTS:
+        raise CoordError(f"unsupported effort {chosen_effort!r}; choose from {EFFORTS}")
+    if chosen_model not in KNOWN_MODELS and chosen_model not in ("opus", "sonnet", "haiku", "fable"):
+        raise CoordError(f"unknown model {chosen_model!r}; known: {KNOWN_MODELS}")
+    return {
+        "tier": tier,
+        "model": chosen_model,
+        "effort": chosen_effort,
+        "source": "override" if (model or effort) else f"tier:{tier}",
+    }
+
+
+# ---------------------------------------------------------------- registry
+
+def empty_registry() -> dict:
+    return {"version": 1, "seq": 0, "repos": {}, "initiatives": {}, "tasks": {},
+            "coordinator": {}, "workers_tab": None}
+
+
+def load_registry() -> dict:
+    return read_json(HOME / "registry.json", None) or empty_registry()
+
+
+@contextmanager
+def registry_edit() -> Iterator[dict]:
+    """Lock, load, yield, and atomically save the registry (skipped on error)."""
+    with locked(HOME / "registry.lock"):
+        reg = load_registry()
+        yield reg
+        atomic_write(HOME / "registry.json", json.dumps(reg, indent=2) + "\n")
+
+
+def get_task(reg: dict, task_id: str) -> dict:
+    if task_id in reg["tasks"]:
+        return reg["tasks"][task_id]
+    matches = [t for t in reg["tasks"] if t.startswith(task_id)]
+    if len(matches) == 1:
+        return reg["tasks"][matches[0]]
+    raise CoordError(f"unknown task {task_id!r}" + (f"; ambiguous: {matches}" if matches else ""))
+
+
+def task_dir(task_id: str) -> Path:
+    return HOME / "tasks" / task_id
+
+
+def set_state(task: dict, state: str, note: str = "") -> None:
+    if task.get("state") == state and not note:
+        return
+    task["state"] = state
+    task["updated"] = now_iso()
+    task.setdefault("history", []).append({"ts": task["updated"], "state": state, "note": note})
+
+
+def log_event(kind: str, task_id: str | None, text: str, **extra: Any) -> None:
+    append_line(HOME / "events.jsonl", {"ts": now_iso(), "source": "coord", "kind": kind,
+                                        "task": task_id, "text": text, **extra})
+
+
+def guard_not_worker() -> None:
+    if os.environ.get("COORD_ROLE") == "worker":
+        raise CoordError("workers may not manage workers; report to the coordinator instead")
+
+
+def guard_herdr() -> None:
+    if os.environ.get("HERDR_ENV") != "1":
+        raise CoordError("not inside a Herdr pane (HERDR_ENV != 1). Start Herdr, open a pane, "
+                         "and run the coordinator there (see docs/OPERATING.md).")
+
+
+# ------------------------------------------------------------------- herdr
+
+def herdr(*args: Any, timeout: float | None = 120, raw: bool = False) -> Any:
+    try:
+        proc = subprocess.run([HERDR, *map(str, args)], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HerdrError("timeout", f"herdr {args[0]} {args[1] if len(args) > 1 else ''} timed out "
+                         "(the action may still have happened; inspect before retrying)") from None
+    if proc.returncode != 0:
+        lines = proc.stderr.strip().splitlines()
+        try:
+            err = json.loads(lines[-1])["error"]
+            code, message = err.get("code", "error"), err.get("message", "")
+        except (ValueError, KeyError, IndexError, TypeError):
+            code, message = "cli", proc.stderr.strip() or f"exit {proc.returncode}"
+        raise HerdrError(code, message)
+    if raw:
+        return proc.stdout
+    try:
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except ValueError:
+        raise HerdrError("bad_output", proc.stdout[:200]) from None
+
+
+def live_agents() -> dict[str, dict]:
+    """Map pane_id -> agent record for every agent Herdr currently recognizes."""
+    return {a["pane_id"]: a for a in herdr("agent", "list")["result"]["agents"]}
+
+
+def pane_exists(pane_id: str) -> bool:
+    try:
+        herdr("pane", "get", pane_id)
+        return True
+    except HerdrError:
+        return False
+
+
+def live_state(task: dict, agents: dict[str, dict]) -> tuple[str, int | None]:
+    """Return (state, state_change_seq) for a task's worker pane.
+
+    States: an agent status, or none/exited (pane alive, no agent)/gone (pane closed)/
+    replaced (a different session now occupies the pane).
+    """
+    worker = task.get("worker") or {}
+    pane = worker.get("pane_id")
+    if not pane:
+        return "none", None
+    agent = agents.get(pane)
+    if agent and agent.get("agent") == "claude":
+        reported = (agent.get("agent_session") or {}).get("value")
+        expected = worker.get("session_id")
+        if reported and expected and reported != expected:
+            return "replaced", agent.get("state_change_seq")
+        return agent.get("agent_status", "unknown"), agent.get("state_change_seq")
+    return ("exited" if pane_exists(pane) else "gone"), None
+
+
+# --------------------------------------------------------------------- git
+
+def git(cwd: Path | str, *args: str) -> str:
+    proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise CoordError(f"git {' '.join(args)} failed in {cwd}: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    return subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+                           f"refs/heads/{branch}"]).returncode == 0
+
+
+# -------------------------------------------------------------- transcripts
+
+def transcript_path(session_id: str | None) -> Path | None:
+    if not session_id:
+        return None
+    hits = glob.glob(str(CLAUDE_PROJECTS / "*" / f"{session_id}.jsonl"))
+    return Path(hits[0]) if hits else None
+
+
+def observe_session(session_id: str | None) -> dict:
+    """Read the actual model/effort/advisor and token usage from a Claude transcript."""
+    path = transcript_path(session_id)
+    out: dict[str, Any] = {"transcript": str(path) if path else None, "model": None,
+                           "effort": None, "advisor": None, "turns": 0, "usage": None}
+    if not path:
+        return out
+    usage_by_request: dict[str, dict] = {}
+    for entry in read_jsonl(path):
+        if entry.get("type") != "assistant":
+            continue
+        msg = entry.get("message") or {}
+        if msg.get("model") and msg.get("model") != "<synthetic>":
+            out.update(model=msg["model"], effort=entry.get("effort"),
+                       advisor=entry.get("advisorModel"), requested=entry.get("requestedModel"))
+        if msg.get("usage") and entry.get("requestId"):
+            usage_by_request[entry["requestId"]] = msg["usage"]
+    out["turns"] = len(usage_by_request)
+    if usage_by_request:
+        keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        out["usage"] = {k: sum(int(u.get(k) or 0) for u in usage_by_request.values()) for k in keys}
+    return out
+
+
+def read_report(task_id: str) -> dict | None:
+    return read_json(task_dir(task_id) / "status.json", None)
+
+
+# ------------------------------------------------------------ brief render
+
+def task_paths(task: dict, repo: str) -> list[str]:
+    out = []
+    for entry in task.get("paths", []):
+        if ":" in entry:
+            name, path = entry.split(":", 1)
+            if name == repo:
+                out.append(path)
+        else:
+            out.append(entry)
+    return out
+
+
+def paths_overlap(a: list[str], b: list[str]) -> bool:
+    if not a or not b:
+        return True  # an undeclared path set means "whole repo"
+    for x in a:
+        for y in b:
+            x2, y2 = x.rstrip("/"), y.rstrip("/")
+            if x2 == y2 or x2.startswith(y2 + "/") or y2.startswith(x2 + "/"):
+                return True
+    return False
+
+
+def render_brief(reg: dict, task: dict, plan: list[dict]) -> str:
+    tid = task["id"]
+    d = task_dir(tid)
+    lines = [f"# Task {tid}: {task['title']}", ""]
+    if task.get("initiative"):
+        init = reg["initiatives"].get(task["initiative"], {})
+        lines += [f"Initiative: {task['initiative']} — {init.get('title', '')}"]
+        if init.get("interfaces"):
+            lines += ["Interface expectations:"] + [f"- {i}" for i in init["interfaces"]]
+        if init.get("order"):
+            lines += [f"Integration order: {' -> '.join(init['order'])}"]
+        lines.append("")
+    lines += [f"Assigned: {task['model']} at {task['effort']} effort ({task['model_source']})", "",
+              "## Objective", task.get("objective") or task["title"], ""]
+    if task.get("acceptance"):
+        lines += ["## Acceptance criteria"] + [f"- {a}" for a in task["acceptance"]] + [""]
+    if task.get("context"):
+        lines += ["## Context", task["context"], ""]
+    if task.get("brief_extra"):
+        lines += ["## Details", task["brief_extra"], ""]
+    lines += ["## Repositories and permitted paths"]
+    for p in plan:
+        repo = reg["repos"][p["repo"]]
+        if p["mode"] == "edit":
+            allowed = task_paths(task, p["repo"]) or ["(whole repository)"]
+            lines += [f"- **{p['repo']}** (edit) — work only in `{p['worktree']}`",
+                      f"  - branch `{p['branch']}`, base commit `{p['base_commit'][:12]}`",
+                      f"  - permitted paths: {', '.join(allowed)}"]
+            shared = [s for s in repo.get("shared_paths", []) if s not in allowed]
+            if shared:
+                lines.append(f"  - off-limits shared paths: {', '.join(shared)}")
+            if p.get("source_dirty"):
+                lines.append(f"  - note: the original checkout `{repo['path']}` has uncommitted changes "
+                             "that are NOT in your worktree; do not copy or modify them.")
+        else:
+            lines += [f"- **{p['repo']}** (read-only) — `{p['path']}`; do not modify."]
+        for ins in repo.get("instructions", []):
+            lines.append(f"  - read repo instructions first: `{ins}`")
+    lines += ["", "## Constraints",
+              "- Local commits on your branch are allowed; no push, merge, deploy, or destructive cleanup."]
+    lines += [f"- {c}" for c in task.get("constraints", [])]
+    lines += ["", "## Resources",
+              f"- Ports: {task['port_base']}-{task['port_base'] + 9} (env COORD_PORT_BASE)",
+              f"- TMPDIR: `{d / 'tmp'}`", "",
+              "## Validation required"]
+    lines += [f"- `{v}`" for v in task.get("validation", [])] or ["- Run the relevant existing tests."]
+    lines += ["", "## Coordination files",
+              f"- Progress (append): `{d / 'progress.md'}`",
+              f"- Result (write when done): `{d / 'result.md'}`",
+              "- Report state with `coord report --state <state> --summary \"...\"`", ""]
+    lines.append((TOOL_DIR / "prompts" / "worker.md").read_text())
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ status
+
+def sync_states(reg: dict, agents: dict[str, dict]) -> list[str]:
+    """Fold worker reports and live Herdr state into registry states (coordinator-owned)."""
+    changes = []
+    for tid, task in reg["tasks"].items():
+        if task["state"] in TERMINAL_STATES or not task.get("worker"):
+            continue
+        report = read_report(tid) or {}
+        live, _ = live_state(task, agents)
+        rstate, rseq = report.get("state"), report.get("seq", 0)
+        new = task["state"]
+        if rstate and rseq > task.get("synced_report_seq", 0):
+            task["synced_report_seq"] = rseq
+            new = rstate
+        if live == "blocked" and new == "running":
+            new = "blocked"
+        elif live == "working" and new == "blocked" and rstate != "blocked":
+            new = "running"
+        if new != task["state"]:
+            set_state(task, new, f"sync: report={rstate} live={live}")
+            changes.append(f"{tid}: -> {new}")
+    return changes
+
+
+def next_action(reg: dict, task: dict, live: str, report: dict) -> str:
+    s = task["state"]
+    deps = [d for d in task.get("depends_on", []) if reg["tasks"].get(d, {}).get("state") != "validated"]
+    if s == "planned":
+        return f"wait for {','.join(deps)}" if deps else "launch"
+    if live == "blocked":
+        return "inspect dialog (coord peek); answer it yourself or cancel"
+    if report.get("state") == "blocked" and s == "blocked":
+        return "answer blocker (coord prompt)"
+    if live in ("exited", "gone", "replaced") and s in ("running", "blocked"):
+        return "worker gone: coord relaunch"
+    if s == "ready_for_review":
+        return "review result + diff, then coord set validated|failed"
+    if s == "running" and live in ("idle", "done"):
+        return "idle without final report: inspect"
+    if s == "running":
+        return "wait (watcher will notify)"
+    if s == "failed":
+        return "decide: relaunch, escalate, or cancel"
+    if s == "validated":
+        return "integrate / cleanup"
+    return "-"
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args: argparse.Namespace) -> None:
+    for sub in ("tasks", "logs"):
+        (HOME / sub).mkdir(parents=True, exist_ok=True)
+    created = []
+    if not (HOME / "policy.json").exists():
+        atomic_write(HOME / "policy.json", json.dumps(DEFAULT_POLICY, indent=2) + "\n")
+        created.append("policy.json")
+    if not (HOME / "registry.json").exists():
+        with registry_edit():
+            pass
+        created.append("registry.json")
+    print(f"COORD_HOME={HOME} " + (f"created {', '.join(created)}" if created else "(already initialized)"))
+
+
+def cmd_coordinator(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    with registry_edit() as reg:
+        rec = reg["coordinator"]
+        if sid and rec.get("session_id") and rec["session_id"] != sid:
+            rec.setdefault("previous_sessions", []).append(rec["session_id"])
+        rec.update(session_id=sid, pane_id=os.environ.get("HERDR_PANE_ID"),
+                   workspace_id=os.environ.get("HERDR_WORKSPACE_ID"), registered=now_iso())
+        obs = observe_session(sid)
+        rec["observed"] = {k: obs[k] for k in ("model", "effort", "advisor")}
+    print(json.dumps(rec, indent=2))
+
+
+def cmd_repo_add(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    check_id("repo", args.name)
+    path = Path(args.path).expanduser().resolve()
+    top = Path(git(path, "rev-parse", "--show-toplevel"))
+    instructions = [str(top / f) for f in ("CLAUDE.md", "AGENTS.md", ".claude/CLAUDE.md") if (top / f).exists()]
+    instructions += [str(Path(i).expanduser().resolve()) for i in args.instructions or []]
+    tracked = git(top, "ls-files").splitlines()
+    lockfiles = [f for f in tracked if Path(f).name in LOCKFILES]
+    shared = sorted(set(lockfiles) | set(args.shared or []))
+    with registry_edit() as reg:
+        old = reg["repos"].get(args.name)
+        if old and old["path"] != str(top):
+            raise CoordError(f"repo {args.name!r} already registered at {old['path']}")
+        reg["repos"][args.name] = {"name": args.name, "path": str(top), "kind": args.kind,
+                                   "instructions": instructions, "shared_paths": shared,
+                                   "registered": (old or {}).get("registered", now_iso())}
+    print(f"{'updated' if old else 'registered'} {args.name}: {top} kind={args.kind} "
+          f"shared={shared or '-'} instructions={instructions or '-'}")
+
+
+def cmd_repo_list(args: argparse.Namespace) -> None:
+    for r in load_registry()["repos"].values():
+        print(f"{r['name']:<12} {r['kind']:<9} {r['path']}  shared={len(r['shared_paths'])}")
+
+
+def cmd_initiative_add(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    check_id("initiative", args.id)
+    with registry_edit() as reg:
+        for r in args.repos or []:
+            if r not in reg["repos"]:
+                raise CoordError(f"unknown repo {r!r}")
+        init = reg["initiatives"].setdefault(args.id, {"id": args.id, "created": now_iso(), "decisions": []})
+        init.update(title=args.title, goal=args.goal or init.get("goal", ""),
+                    repos=args.repos or init.get("repos", []),
+                    order=args.order.split(",") if args.order else init.get("order", []),
+                    interfaces=args.interface or init.get("interfaces", []))
+    print(f"initiative {args.id}: {args.title}")
+
+
+def cmd_decide(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    with registry_edit() as reg:
+        if args.initiative not in reg["initiatives"]:
+            raise CoordError(f"unknown initiative {args.initiative!r}")
+        reg["initiatives"][args.initiative]["decisions"].append({"ts": now_iso(), "text": args.text})
+    log_event("decision", None, args.text, initiative=args.initiative)
+    print("recorded")
+
+
+def cmd_task_add(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    policy = load_policy()
+    sel = resolve_model(policy, args.tier, args.model, args.effort)
+    if args.permission_mode and args.permission_mode not in ("acceptEdits", "auto", "manual", "dontAsk", "plan"):
+        raise CoordError("permission mode must be acceptEdits|auto|manual|dontAsk|plan (bypass is not allowed)")
+    brief_extra = Path(args.brief_file).expanduser().read_text() if args.brief_file else ""
+    with registry_edit() as reg:
+        repos = []
+        for spec in args.repo:
+            name, _, mode = spec.partition(":")
+            mode = "read" if args.readonly else (mode or "edit")
+            if name not in reg["repos"] or mode not in ("edit", "read"):
+                raise CoordError(f"bad --repo {spec!r} (registered: {sorted(reg['repos'])}; mode edit|read)")
+            repos.append({"repo": name, "mode": mode})
+        for dep in args.depends_on or []:
+            get_task(reg, dep)
+        if args.initiative and args.initiative not in reg["initiatives"]:
+            raise CoordError(f"unknown initiative {args.initiative!r}")
+        if args.id:
+            check_id("task", args.id)
+        if args.id and args.id in reg["tasks"]:
+            if reg["tasks"][args.id]["title"] != args.title:
+                raise CoordError(f"task id {args.id} exists with a different title")
+            print(f"exists {args.id}")
+            return
+        reg["seq"] += 1
+        seq = reg["seq"]
+        tid = args.id or f"t{seq:03d}-{slugify(args.title)}"
+        task = {
+            "id": tid, "seq": seq, "title": args.title, "initiative": args.initiative,
+            "objective": args.objective, "acceptance": args.accept or [], "context": args.context,
+            "constraints": args.constraint or [], "validation": args.validate or [],
+            "brief_extra": brief_extra, "repos": repos, "paths": args.paths or [],
+            "depends_on": [get_task(reg, d)["id"] for d in args.depends_on or []],
+            "permission_mode": args.permission_mode or policy["default_permission_mode"],
+            "port_base": policy["port_base"] + (seq % 1000) * policy["port_block"],
+            "escalation_of": None, "escalations": [], "worker": None, "worker_history": [],
+            "validation_evidence": [], "created": now_iso(), **sel,
+            "model_source": sel["source"],
+        }
+        task.pop("source")
+        set_state(task, "planned", "created")
+        reg["tasks"][tid] = task
+    task_dir(tid).mkdir(parents=True, exist_ok=True)
+    log_event("task_added", tid, args.title)
+    print(f"{tid}  {sel['model']} / {sel['effort']} ({task['model_source']})")
+
+
+def cmd_task_set(args: argparse.Namespace) -> None:
+    """Override model/effort/tier (next launch) or point a read-only repo at another checkout."""
+    guard_not_worker()
+    policy = load_policy()
+    with registry_edit() as reg:
+        task = get_task(reg, args.task)
+        for spec in args.read_path or []:
+            name, _, path = spec.partition("=")
+            entry = next((r for r in task["repos"] if r["repo"] == name and r["mode"] == "read"), None)
+            if not entry or not Path(path).expanduser().is_dir():
+                raise CoordError(f"--read-path {spec!r}: needs a read-only repo of this task and an existing dir")
+            entry["path"] = str(Path(path).expanduser().resolve())
+            print(f"{task['id']}: {name} (read-only) -> {entry['path']}")
+        if not (args.tier or args.model or args.effort):
+            return
+        sel = resolve_model(policy, args.tier or task["tier"], args.model, args.effort)
+        if not (args.model or args.effort):
+            sel = resolve_model(policy, sel["tier"], None, None)
+        before = (task["model"], task["effort"])
+        task.update(tier=sel["tier"], model=sel["model"], effort=sel["effort"], model_source=sel["source"])
+        task["escalations"].append({"ts": now_iso(), "from": before, "to": (sel["model"], sel["effort"]),
+                                    "reason": args.reason or "override", "applied": "next launch"})
+    print(f"{task['id']}: {before[0]}/{before[1]} -> {sel['model']}/{sel['effort']} "
+          f"(applies at next launch/relaunch)")
+
+
+def plan_repos(reg: dict, task: dict, policy: dict) -> list[dict]:
+    root = Path(policy["worktree_root"]).expanduser()
+    plan = []
+    for r in task["repos"]:
+        repo = reg["repos"][r["repo"]]
+        if r["mode"] == "read":
+            plan.append({"repo": r["repo"], "mode": "read", "path": r.get("path") or repo["path"]})
+            continue
+        prev = next((p for p in task.get("worktrees", []) if p["repo"] == r["repo"]), None)
+        if prev:
+            plan.append(prev)
+            continue
+        src = Path(repo["path"])
+        dirty = [line for line in git(src, "status", "--porcelain").splitlines() if line]
+        plan.append({"repo": r["repo"], "mode": "edit", "source": str(src),
+                     "worktree": str(root / r["repo"] / task["id"]), "branch": f"coord/{task['id']}",
+                     "base_commit": git(src, "rev-parse", "HEAD"), "source_dirty": dirty})
+    return plan
+
+
+def ensure_worktree(p: dict) -> None:
+    """Create the task's worktree, or accept an existing one on the expected branch (idempotent)."""
+    wt, src, branch = Path(p["worktree"]), Path(p["source"]), p["branch"]
+    if wt.exists():
+        if f"worktree {wt}\n" not in git(src, "worktree", "list", "--porcelain") + "\n":
+            raise CoordError(f"{wt} exists but is not a worktree of {src}")
+        current = git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+        if current != branch:
+            raise CoordError(f"{wt} is on {current}, expected {branch}")
+        return
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    if branch_exists(src, branch):
+        git(src, "worktree", "add", str(wt), branch)
+    else:
+        git(src, "worktree", "add", "-b", branch, str(wt), p["base_commit"])
+
+
+def check_conflicts(reg: dict, task: dict, agents: dict) -> list[str]:
+    problems = []
+    for other in reg["tasks"].values():
+        if other["id"] == task["id"] or other["state"] not in ACTIVE_STATES:
+            continue
+        for r in task["repos"]:
+            if r["mode"] != "edit":
+                continue
+            if any(o["repo"] == r["repo"] and o["mode"] == "edit" for o in other["repos"]):
+                if paths_overlap(task_paths(task, r["repo"]), task_paths(other, r["repo"])):
+                    problems.append(f"{r['repo']}: paths overlap with active task {other['id']}")
+    return problems
+
+
+def ensure_workers_tab(policy: dict) -> str:
+    """Return the anchor pane of the workers tab, creating the tab if needed."""
+    reg = load_registry()
+    tab = reg.get("workers_tab") or {}
+    if tab.get("anchor_pane") and pane_exists(tab["anchor_pane"]):
+        return tab["anchor_pane"]
+    res = herdr("tab", "create", "--workspace", os.environ["HERDR_WORKSPACE_ID"],
+                "--label", policy["workers_tab_label"], "--cwd", str(HOME),
+                "--env", f"COORD_HOME={HOME}", "--no-focus")["result"]
+    anchor = res["root_pane"]["pane_id"]
+    with registry_edit() as reg:
+        reg["workers_tab"] = {"tab_id": res["tab"]["tab_id"], "anchor_pane": anchor, "created": now_iso()}
+    time.sleep(0.5)
+    herdr("pane", "run", anchor, f"{shlex.quote(str(TOOL_DIR / 'bin' / 'coord'))} watch log")
+    return anchor
+
+
+def new_worker_pane(anchor: str, cwd: str, env: dict[str, str]) -> str:
+    layout = herdr("pane", "layout", "--pane", anchor)["result"]["layout"]
+    biggest = max(layout["panes"], key=lambda p: p["rect"]["width"] * p["rect"]["height"])
+    rect = biggest["rect"]
+    direction = "right" if rect["width"] > rect["height"] * 2.2 else "down"
+    env_args: list[str] = []
+    for k, v in env.items():
+        env_args += ["--env", f"{k}={v}"]
+    res = herdr("pane", "split", biggest["pane_id"], "--direction", direction, "--cwd", cwd,
+                "--no-focus", *env_args)
+    return res["result"]["pane"]["pane_id"]
+
+
+def start_worker(task_id: str, *, resume: str | None = None, fork_from: str | None = None,
+                 kickoff: str | None = None, dry_run: bool = False) -> None:
+    """Create worktrees, a pane, and an interactive Claude worker; record every identity."""
+    policy = load_policy()
+    with locked(HOME / "worktrees.lock"):
+        reg = load_registry()
+        task = get_task(reg, task_id)
+        tid = task["id"]
+        plan = plan_repos(reg, task, policy)
+        if not dry_run:
+            for p in plan:
+                if p["mode"] == "edit":
+                    ensure_worktree(p)
+            with registry_edit() as reg:
+                reg["tasks"][tid]["worktrees"] = [p for p in plan if p["mode"] == "edit"]
+    cwd = next((p["worktree"] for p in plan if p["mode"] == "edit"), plan[0].get("path"))
+    d = task_dir(tid)
+    session_id = resume or str(uuid.uuid4())
+    agent_name = f"{policy['agent_prefix']}{task['seq']:03d}-{slugify(task['title'], 24)}"[:32]
+    claude_args = ["--model", task["model"], "--effort", task["effort"], "--name", tid,
+                   "--add-dir", str(d)]
+    if fork_from:
+        claude_args += ["--resume", fork_from, "--fork-session"]
+    elif resume and transcript_path(resume):
+        claude_args += ["--resume", resume]
+    else:  # fresh, or a session that never produced a transcript (e.g. stopped at a startup dialog)
+        claude_args += ["--session-id", session_id]
+    for p in plan:
+        target = p.get("worktree") or p.get("path")
+        if target != cwd:
+            claude_args += ["--add-dir", target]
+    if task.get("permission_mode"):
+        claude_args += ["--permission-mode", task["permission_mode"]]
+    registry_file = HOME / "registry.json"
+    claude_args += ["--disallowedTools", ",".join(WORKER_DENY + [f"Edit(/{registry_file})",
+                                                                  f"Write(/{registry_file})"])]
+    env = {"COORD_HOME": str(HOME), "COORD_TASK_ID": tid, "COORD_ROLE": "worker",
+           "COORD_PORT_BASE": str(task["port_base"]), "TMPDIR": str(d / "tmp"),
+           "CLAUDE_CODE_EFFORT_LEVEL": task["effort"]}
+    if policy.get("advisor", "disabled") == "disabled":
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
+    if dry_run:
+        print(json.dumps({"task": tid, "agent_name": agent_name, "cwd": cwd, "env": env,
+                          "command": ["claude", *claude_args], "repos": plan}, indent=2))
+        return
+    (d / "tmp").mkdir(parents=True, exist_ok=True)
+    reg = load_registry()
+    atomic_write(d / "brief.md", render_brief(reg, reg["tasks"][tid], plan))
+    for p in plan:
+        if p.get("source_dirty"):
+            print(f"note: {p['source']} has uncommitted changes the worker will NOT see: "
+                  f"{len(p['source_dirty'])} path(s)")
+    anchor = ensure_workers_tab(policy)
+    pane = new_worker_pane(anchor, cwd, env)
+    worker = {"agent_name": agent_name, "pane_id": pane, "session_id": None if fork_from else session_id,
+              "fork_from": fork_from, "resumed_from": resume, "cwd": cwd, "model": task["model"],
+              "effort": task["effort"], "launched": now_iso(), "status": "starting"}
+    with registry_edit() as reg:
+        t = reg["tasks"][tid]
+        if t.get("worker"):
+            t["worker_history"].append(t["worker"])
+        t["worker"] = worker
+    log_event("worker_pane", tid, f"pane {pane} for {agent_name}", pane=pane)
+    time.sleep(0.5)
+    try:
+        herdr("agent", "start", agent_name, "--kind", "claude", "--pane", pane, "--timeout", "90000",
+              "--", *claude_args, timeout=120)
+    except CoordError as exc:
+        with registry_edit() as reg:
+            reg["tasks"][tid]["worker"]["status"] = f"start_error:{getattr(exc, 'code', 'error')}"
+            set_state(reg["tasks"][tid], "blocked", f"worker start: {exc}")
+        raise CoordError(f"{exc}. Do not relaunch before inspecting. Pane {pane} kept: `coord peek {tid}`. "
+                         "If a trust/consent dialog is shown, answer it yourself, then `coord kick "
+                         f"{tid}`.") from None
+    kick(tid, kickoff)
+
+
+def kick(task_id: str, kickoff: str | None = None) -> None:
+    """Send the kickoff prompt once and record whether Herdr observed the turn starting."""
+    reg = load_registry()
+    task = get_task(reg, task_id)
+    tid, worker = task["id"], task["worker"]
+    if worker.get("prompted"):
+        raise CoordError(f"{tid} already prompted at {worker['prompted']}; use `coord prompt` to redirect")
+    try:
+        agent = live_agents().get(worker["pane_id"]) or {}
+    except CoordError:
+        agent = {}
+    text = kickoff or (f"You are a coord worker for task {tid}. Read your brief at "
+                       f"{task_dir(tid) / 'brief.md'} in full, then carry it out now, following its "
+                       "Worker protocol section.")
+    try:
+        herdr("agent", "prompt", worker["pane_id"], text, "--wait", "--until", "working",
+              "--until", "blocked", "--timeout", "30000", timeout=60)
+        status = "prompted"
+    except CoordError as exc:
+        status = f"prompt_unconfirmed:{getattr(exc, 'code', 'error')}"  # never auto-resend; inspect first
+    with registry_edit() as reg:
+        t = reg["tasks"][tid]
+        w = t["worker"]
+        w.update(status=status, prompted=now_iso())
+        reported = (agent.get("agent_session") or {}).get("value")
+        if reported:
+            w["herdr_session_id"] = reported
+            w["session_id"] = w.get("session_id") or reported
+        set_state(t, "running", f"launched {w['agent_name']} in {w['pane_id']} ({status})")
+    log_event("launched", tid, f"{worker['agent_name']} {status}", pane=worker["pane_id"])
+    print(f"{tid}: {worker['agent_name']} pane={worker['pane_id']} session={worker.get('session_id')} "
+          f"{task['model']}/{task['effort']} [{status}]")
+
+
+def cmd_launch(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    guard_herdr()
+    policy = load_policy()
+    tid = get_task(load_registry(), args.task)["id"]
+    with locked(task_dir(tid) / ".launch.lock", blocking=False):
+        reg = load_registry()
+        task = reg["tasks"][tid]
+        agents = live_agents()
+        live, _ = live_state(task, agents)
+        if live in AGENT_LIVE:
+            raise CoordError(f"{tid} already has a live worker ({task['worker']['agent_name']} in "
+                             f"{task['worker']['pane_id']}, {live}); not launching a duplicate")
+        if task.get("worker"):
+            raise CoordError(f"{tid} already had a worker (now {live}); use `coord relaunch {tid}` to resume it")
+        if task["state"] != "planned":
+            raise CoordError(f"{tid} is {task['state']}")
+        unmet = [d for d in task["depends_on"] if reg["tasks"][d]["state"] != "validated"]
+        if unmet and not args.ignore_deps:
+            raise CoordError(f"{tid} depends on unvalidated {unmet} (use --ignore-deps to override)")
+        if not args.dry_run:
+            check_capacity(reg, task, agents, policy, args.allow_overlap)
+        start_worker(tid, fork_from=args.fork_from, dry_run=args.dry_run)
+
+
+def check_capacity(reg: dict, task: dict, agents: dict, policy: dict, allow_overlap: bool) -> None:
+    """Enforce the global worker cap and per-repo path ownership before starting a worker."""
+    active = sum(1 for t in reg["tasks"].values() if live_state(t, agents)[0] in AGENT_LIVE)
+    if active >= policy["max_active_workers"]:
+        raise CoordError(f"{active} active workers (max {policy['max_active_workers']}); "
+                         "close, finish or cancel one first")
+    problems = check_conflicts(reg, task, agents)
+    if problems and not allow_overlap:
+        raise CoordError("ownership conflict:\n  " + "\n  ".join(problems) +
+                         "\nserialize with --depends-on, narrow --paths, or pass --allow-overlap")
+
+
+def cmd_kick(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    tid = get_task(load_registry(), args.task)["id"]
+    with locked(task_dir(tid) / ".launch.lock", blocking=False):
+        kick(tid)
+
+
+def stop_worker(task: dict, force: bool) -> None:
+    """Ask a live worker to exit (Esc, then /exit), then close the pane coord created."""
+    worker = task["worker"]
+    pane = worker["pane_id"]
+    live, _ = live_state(task, live_agents())
+    if live == "working" and not force:
+        raise CoordError(f"{task['id']} is working; pass --force to interrupt it")
+    if live in AGENT_LIVE:
+        herdr("agent", "send-keys", pane, "esc")
+        time.sleep(1.0)
+        for _ in range(2):
+            try:
+                herdr("agent", "prompt", pane, "/exit")
+                break
+            except HerdrError:
+                herdr("agent", "send-keys", pane, "esc")
+                time.sleep(1.0)
+        deadline = time.time() + 20
+        while time.time() < deadline and pane in live_agents():
+            time.sleep(1)
+        if pane in live_agents():
+            herdr("agent", "send-keys", pane, "ctrl+c", "ctrl+c")
+            time.sleep(2)
+    if pane_exists(pane):
+        herdr("pane", "close", pane)
+
+
+def cmd_cancel(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    reg = load_registry()
+    task = get_task(reg, args.task)
+    if task.get("worker"):
+        stop_worker(task, force=True)
+    with registry_edit() as reg:
+        t = reg["tasks"][task["id"]]
+        set_state(t, "cancelled", args.reason or "cancelled by coordinator")
+    log_event("cancelled", task["id"], args.reason or "")
+    kept = ", ".join(w["worktree"] for w in task.get("worktrees", [])) or "none"
+    print(f"{task['id']} cancelled. Worktrees kept: {kept} (remove with `coord cleanup {task['id']} --yes`)")
+
+
+def cmd_close(args: argparse.Namespace) -> None:
+    """Stop a finished worker's Claude session and close its pane; state, session, and worktrees are kept."""
+    guard_not_worker()
+    task = get_task(load_registry(), args.task)
+    if not task.get("worker"):
+        raise CoordError(f"{task['id']} has no worker")
+    stop_worker(task, force=args.force)
+    with registry_edit() as reg:
+        reg["tasks"][task["id"]]["worker"]["status"] = "closed"
+    log_event("closed", task["id"], "worker closed")
+    print(f"{task['id']}: worker closed (session {task['worker'].get('session_id')} can be resumed with relaunch)")
+
+
+def cmd_relaunch(args: argparse.Namespace) -> None:
+    """Restart a task's worker, resuming its Claude session (optionally on another model/effort)."""
+    guard_not_worker()
+    guard_herdr()
+    policy = load_policy()
+    reg = load_registry()
+    task = get_task(reg, args.task)
+    tid = task["id"]
+    if not task.get("worker"):
+        raise CoordError(f"{tid} was never launched; use `coord launch`")
+    if task["state"] in TERMINAL_STATES:
+        raise CoordError(f"{tid} is {task['state']}")
+    with locked(task_dir(tid) / ".launch.lock", blocking=False):
+        live, _ = live_state(task, live_agents())
+        if live in AGENT_LIVE:
+            if not args.stop:
+                raise CoordError(f"{tid} worker is live ({live}); pass --stop to stop it first")
+            stop_worker(task, force=args.force)
+        elif live == "exited":
+            herdr("pane", "close", task["worker"]["pane_id"])
+        check_capacity(load_registry(), task, live_agents(), policy, args.allow_overlap)
+        before = (task["model"], task["effort"])
+        if args.model or args.effort or args.tier:
+            sel = resolve_model(policy, args.tier or task["tier"], args.model, args.effort)
+            with registry_edit() as reg:
+                t = reg["tasks"][tid]
+                t.update(tier=sel["tier"], model=sel["model"], effort=sel["effort"], model_source=sel["source"])
+                t["escalations"].append({"ts": now_iso(), "from": before, "to": (sel["model"], sel["effort"]),
+                                         "reason": args.reason or "relaunch override", "applied": "relaunch"})
+        resume = None if args.fresh else task["worker"].get("session_id")
+        reg = load_registry()
+        t = reg["tasks"][tid]
+        kickoff = (f"The coordinator restarted you for task {tid} (now {t['model']} at {t['effort']} effort). "
+                   f"Re-read your brief at {task_dir(tid) / 'brief.md'} and progress at "
+                   f"{task_dir(tid) / 'progress.md'}; do not repeat completed work. Continue the task. "
+                   + (args.message or ""))
+        start_worker(tid, resume=resume, kickoff=kickoff)
+
+
+def cmd_escalate(args: argparse.Namespace) -> None:
+    """Create a bounded escalation task (default: exceptional tier) with a focused question."""
+    guard_not_worker()
+    policy = load_policy()
+    sel = resolve_model(policy, args.tier, args.model, args.effort)
+    with registry_edit() as reg:
+        parent = get_task(reg, args.task)
+        pid = parent["id"]
+        d = task_dir(pid)
+        reg["seq"] += 1
+        seq = reg["seq"]
+        tid = f"t{seq:03d}-esc-{slugify(parent['title'], 14)}"
+        repos = []
+        for r in parent["repos"]:
+            wt = next((w["worktree"] for w in parent.get("worktrees", []) if w["repo"] == r["repo"]), None)
+            repos.append({"repo": r["repo"], "mode": "read", "path": wt or reg["repos"][r["repo"]]["path"]})
+        context = (f"Escalated from task {pid} ({parent['model']}/{parent['effort']}). Prior evidence: brief "
+                   f"{d / 'brief.md'}, progress {d / 'progress.md'}, result {d / 'result.md'} (some may not "
+                   "exist). Read them first and do not repeat completed work.\n\n" + (args.context or ""))
+        task = {
+            "id": tid, "seq": seq, "title": f"Escalation for {pid}", "initiative": parent.get("initiative"),
+            "objective": args.question, "acceptance": args.accept or [
+                "A direct answer to the question with supporting evidence (file:line, command output)",
+                "Explicit confidence and what would change the conclusion"],
+            "context": context, "constraints": ["Read-only analysis: do not modify any repository."],
+            "validation": [], "brief_extra": "", "repos": repos, "paths": [], "depends_on": [],
+            "permission_mode": parent.get("permission_mode"),
+            "port_base": policy["port_base"] + (seq % 1000) * policy["port_block"],
+            "escalation_of": pid, "escalations": [], "worker": None, "worker_history": [],
+            "validation_evidence": [], "created": now_iso(), "tier": sel["tier"], "model": sel["model"],
+            "effort": sel["effort"], "model_source": sel["source"],
+        }
+        set_state(task, "planned", f"escalation of {pid}")
+        reg["tasks"][tid] = task
+        parent["escalations"].append({"ts": now_iso(), "from": (parent["model"], parent["effort"]),
+                                      "to": (sel["model"], sel["effort"]), "child": tid,
+                                      "reason": args.question})
+    task_dir(tid).mkdir(parents=True, exist_ok=True)
+    log_event("escalated", pid, args.question, child=tid)
+    print(f"{tid}: escalation of {pid} -> {sel['model']}/{sel['effort']}. Launch with `coord launch {tid}`.")
+
+
+def cmd_prompt(args: argparse.Namespace) -> None:
+    """Redirect a live worker with a new instruction (refused by Herdr if it is at a dialog)."""
+    guard_not_worker()
+    reg = load_registry()
+    task = get_task(reg, args.task)
+    if not task.get("worker"):
+        raise CoordError(f"{task['id']} has no worker")
+    herdr("agent", "prompt", task["worker"]["pane_id"], args.text, "--wait", "--until", "working",
+          "--until", "blocked", "--timeout", "30000", timeout=60)
+    with registry_edit() as reg:
+        t = reg["tasks"][task["id"]]
+        t.setdefault("redirects", []).append({"ts": now_iso(), "text": args.text})
+        if t["state"] in ("blocked", "ready_for_review", "failed"):
+            set_state(t, "running", "redirected")
+    log_event("redirect", task["id"], args.text)
+    print(f"sent to {task['worker']['agent_name']}")
+
+
+def cmd_set(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    with registry_edit() as reg:
+        task = get_task(reg, args.task)
+        if args.evidence:
+            task["validation_evidence"].append({"ts": now_iso(), "evidence": args.evidence})
+        if args.state == "validated" and not (args.evidence or task["validation_evidence"]):
+            raise CoordError("validated requires --evidence (what you reviewed/ran and the result)")
+        set_state(task, args.state, args.note or args.evidence or "")
+    log_event("state", task["id"], f"-> {args.state}", note=args.note, evidence=args.evidence)
+    print(f"{task['id']}: {args.state}")
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    """Worker-side: record this worker's state in its own task directory."""
+    own = os.environ.get("COORD_TASK_ID")
+    tid = args.task or own
+    if not tid:
+        raise CoordError("COORD_TASK_ID is not set (run inside a worker pane or pass --task)")
+    if os.environ.get("COORD_ROLE") == "worker" and tid != own:
+        raise CoordError(f"a worker may only report on its own task ({own})")
+    check_id("task", tid)
+    d = task_dir(tid)
+    if not d.is_dir():
+        raise CoordError(f"no task directory {d}")
+    with locked(d / ".status.lock"):
+        cur = read_json(d / "status.json", {}) or {}
+        rec = {"task": tid, "state": args.state, "summary": args.summary, "ts": now_iso(),
+               "seq": int(cur.get("seq", 0)) + 1}
+        atomic_write(d / "status.json", json.dumps(rec, indent=2) + "\n")
+        with open(d / "progress.md", "a") as fh:
+            fh.write(f"- {rec['ts']} [{args.state}] {args.summary}\n")
+    print(f"reported {tid} {args.state} (seq {rec['seq']})")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    agents = live_agents()
+    if not args.no_sync and os.environ.get("COORD_ROLE") != "worker":
+        with registry_edit() as reg:
+            sync_states(reg, agents)
+    reg = load_registry()
+    rows = []
+    for tid, task in reg["tasks"].items():
+        if not args.all and task["state"] in TERMINAL_STATES:
+            continue
+        live, _ = live_state(task, agents)
+        report = read_report(tid) or {}
+        worker = task.get("worker") or {}
+        obs = observe_session(worker.get("session_id")) if worker else {}
+        model = short_model(task["model"])
+        if obs.get("model"):
+            model += " ✓" if obs["model"] == task["model"] else f" ≠{short_model(obs['model'])}!"
+        effort = task["effort"]
+        if obs.get("effort"):
+            effort += " ✓" if obs["effort"] == task["effort"] else f" ≠{obs['effort']}!"
+        repos = ",".join(r["repo"] + ("" if r["mode"] == "edit" else "(ro)") for r in task["repos"])
+        rows.append([tid, repos, worker.get("agent_name", "-") + (f"@{worker['pane_id']}" if worker else ""),
+                     model, effort, task["state"], live, report.get("state", "-"),
+                     next_action(reg, task, live, report)])
+    if args.json:
+        keys = ["task", "repos", "worker", "model", "effort", "state", "live", "report", "next"]
+        print(json.dumps([dict(zip(keys, r, strict=False)) for r in rows], indent=2))
+        return
+    coord = reg.get("coordinator") or {}
+    if coord.get("session_id"):
+        o = observe_session(coord["session_id"])
+        print(f"coordinator: session {coord['session_id']} pane {coord.get('pane_id')} "
+              f"model {o.get('model')} effort {o.get('effort')} advisor {o.get('advisor') or 'off'}")
+    print(f"watcher: {'running pid ' + str(watcher_pid()) if watcher_pid() else 'STOPPED'}   "
+          f"unread notifications: {len(unread_inbox())}")
+    if not rows:
+        print("no active tasks")
+        return
+    header = ["TASK", "REPOS", "WORKER", "MODEL", "EFFORT", "STATE", "LIVE", "REPORT", "NEXT"]
+    widths = [max(len(str(x)) for x in col) for col in zip(header, *rows, strict=False)]
+    for row in [header, *rows]:
+        print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=False)).rstrip())
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    reg = load_registry()
+    task = get_task(reg, args.task)
+    tid = task["id"]
+    d = task_dir(tid)
+    worker = task.get("worker") or {}
+    live, _ = live_state(task, live_agents()) if worker else ("none", None)
+    print(f"# {tid}: {task['title']}\nstate={task['state']} live={live} tier={task['tier']} "
+          f"requested={task['model']}/{task['effort']} ({task['model_source']})")
+    if task.get("escalation_of"):
+        print(f"escalation of: {task['escalation_of']}")
+    if worker:
+        obs = observe_session(worker.get("session_id"))
+        print(f"worker: {worker['agent_name']} pane={worker['pane_id']} session={worker.get('session_id')} "
+              f"status={worker.get('status')}\nobserved: model={obs['model']} effort={obs['effort']} "
+              f"advisor={obs['advisor'] or 'off'} turns={obs['turns']} usage={obs['usage']}")
+        if len(task["worker_history"]):
+            prev = [(w["agent_name"], w.get("session_id"), w["model"], w["effort"]) for w in task["worker_history"]]
+            print(f"previous workers: {prev}")
+    for e in task["escalations"]:
+        print(f"escalation: {e}")
+    for w in task.get("worktrees", []):
+        print(f"\n## {w['repo']}: {w['worktree']} ({w['branch']} from {w['base_commit'][:12]})")
+        if Path(w["worktree"]).exists():
+            print(git(w["worktree"], "log", "--oneline", f"{w['base_commit']}..HEAD") or "(no commits)")
+            stat = git(w["worktree"], "diff", "--stat", w["base_commit"])
+            dirty = git(w["worktree"], "status", "--short")
+            print(stat or "(no diff vs base)")
+            if dirty:
+                print(f"uncommitted in worktree:\n{dirty}")
+    report = read_report(tid)
+    print(f"\n## report\n{json.dumps(report) if report else '(none)'}")
+    for name in ("progress.md", "result.md"):
+        p = d / name
+        if p.exists():
+            text = p.read_text()
+            if name == "progress.md":
+                text = "\n".join(text.splitlines()[-15:])
+            print(f"\n## {name} ({p})\n{text}")
+    events = [e for e in read_jsonl(HOME / "events.jsonl") if e.get("task") == tid][-8:]
+    print("\n## recent events")
+    for e in events:
+        print(f"{e['ts']} {e.get('source')} {e['kind']}: {e.get('text', '')}")
+
+
+def cmd_peek(args: argparse.Namespace) -> None:
+    task = get_task(load_registry(), args.task)
+    if not task.get("worker"):
+        raise CoordError("no worker")
+    print(herdr("pane", "read", task["worker"]["pane_id"], "--source", "recent-unwrapped",
+                "--lines", str(args.lines), raw=True))
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Compare requested model/effort with Herdr-reported session and transcript ground truth."""
+    reg = load_registry()
+    agents = live_agents()
+    ids = [get_task(reg, args.task)["id"]] if args.task else [t for t in reg["tasks"] if reg["tasks"][t].get("worker")]
+    for tid in ids:
+        task = reg["tasks"][tid]
+        w = task["worker"]
+        agent = agents.get(w["pane_id"]) or {}
+        herdr_sid = (agent.get("agent_session") or {}).get("value")
+        obs = observe_session(w.get("session_id") or herdr_sid)
+        ok_model = obs["model"] == task["model"] if obs["model"] else None
+        ok_effort = obs["effort"] == task["effort"] if obs["effort"] else None
+        verdict = "UNVERIFIED (no turn yet)" if ok_model is None else (
+            "OK" if ok_model and ok_effort else "MISMATCH")
+        print(f"{tid}: requested {task['model']}/{task['effort']} | observed {obs['model']}/{obs['effort']} "
+              f"advisor={obs['advisor'] or 'off'} | session recorded={w.get('session_id')} herdr={herdr_sid} "
+              f"-> {verdict}")
+        if obs["model"]:
+            with registry_edit() as r2:
+                r2["tasks"][tid]["worker"]["observed"] = {"model": obs["model"], "effort": obs["effort"],
+                                                          "advisor": obs["advisor"], "checked": now_iso()}
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    guard_not_worker()
+    reg = load_registry()
+    task = get_task(reg, args.task)
+    if task["state"] not in ("validated", "cancelled", "failed"):
+        raise CoordError(f"{task['id']} is {task['state']}; cleanup only after validated/cancelled/failed")
+    if task.get("worker") and live_state(task, live_agents())[0] in AGENT_LIVE:
+        raise CoordError(f"{task['id']} worker is still live; `coord close` it first")
+    for w in task.get("worktrees", []):
+        if Path(w["worktree"]).exists():
+            ignored = git(w["worktree"], "status", "--ignored", "--porcelain").splitlines()
+            ignored = [line[3:] for line in ignored if line.startswith("!!")]
+            if ignored:
+                print(f"{w['worktree']}: ignored files that will be deleted: {', '.join(ignored[:20])}")
+    if not args.yes:
+        raise CoordError("cleanup removes worktree directories (branches and commits are kept); re-run with --yes")
+    for w in task.get("worktrees", []):
+        if not Path(w["worktree"]).exists():
+            continue
+        git(w["source"], "worktree", "remove", w["worktree"])  # refuses if the worktree is dirty
+        print(f"removed {w['worktree']} (branch {w['branch']} kept)")
+
+
+# ----------------------------------------------------------------- watcher
+
+def launched_age(worker: dict) -> float:
+    try:
+        return time.time() - datetime.fromisoformat(worker["launched"]).timestamp()
+    except (KeyError, ValueError):
+        return float("inf")
+
+
+def watcher_pid() -> int | None:
+    try:
+        pid = int((HOME / "watcher.pid").read_text().strip())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return None
+    return pid if "watch\x00run" in cmdline else None
+
+
+class Watcher:
+    """Deterministic supervisor: Herdr events trigger reconciles; polling is the fallback."""
+
+    def __init__(self) -> None:
+        self.policy = load_policy()
+        self.state = read_json(HOME / "watcher-state.json", None) or {"next_id": 0, "keys": [], "tasks": {}}
+        inbox_max = max((e.get("id", 0) for e in read_jsonl(HOME / "inbox.jsonl")), default=0)
+        self.state["next_id"] = max(self.state["next_id"], inbox_max, inbox_cursor())
+        self.stop = False
+        self.sub: socket.socket | None = None
+        self.sub_panes: tuple[str, ...] | None = None
+
+    def log(self, msg: str) -> None:
+        print(f"{now_iso()} {msg}", flush=True)
+
+    def save(self) -> None:
+        self.state["keys"] = self.state["keys"][-2000:]
+        atomic_write(HOME / "watcher-state.json", json.dumps(self.state, indent=1))
+
+    def notify(self, tid: str, key: str, kind: str, text: str) -> None:
+        full = f"{tid}:{key}"
+        if full in self.state["keys"]:
+            return
+        self.state["keys"].append(full)
+        self.state["next_id"] += 1
+        entry = {"id": self.state["next_id"], "ts": now_iso(), "task": tid, "kind": kind, "text": text}
+        append_line(HOME / "inbox.jsonl", entry)
+        append_line(HOME / "events.jsonl", {**entry, "source": "watcher"})
+        self.save()
+        self.log(f"NOTIFY {tid} {kind}: {text}")
+        if self.policy["watch"].get("toast") and kind in TOAST_KINDS:
+            try:
+                herdr("notification", "show", f"coord {tid}: {kind}", "--body", text[:200], timeout=5)
+            except (CoordError, subprocess.SubprocessError):
+                pass
+
+    def reconcile(self) -> None:
+        reg = load_registry()
+        agents = live_agents()
+        confirm = self.policy["watch"]["idle_confirm_seconds"]
+        now = time.time()
+        for tid, task in reg["tasks"].items():
+            worker = task.get("worker")
+            if not worker or task["state"] in TERMINAL_STATES or worker.get("status") == "closed":
+                continue
+            if worker.get("status") == "starting" and launched_age(worker) < 120:
+                continue  # launch in progress; after 2 minutes a stuck launch is supervised normally
+            wkey = f"{worker['pane_id']}|{worker.get('launched')}"
+            ts = self.state["tasks"].setdefault(tid, {"report_seq": 0})
+            if ts.get("worker_key") != wkey:
+                ts.update(worker_key=wkey, live=None, idle_since=None, turn_reported=False)
+            report = read_report(tid)
+            if report and report.get("seq", 0) > ts["report_seq"]:
+                ts["report_seq"] = report["seq"]
+                ts["turn_reported"] = report["state"] != "running"
+                self.notify(tid, f"report:{report['seq']}", report["state"],
+                            f"{report['state']}: {report.get('summary', '')}")
+            live, seq = live_state(task, agents)
+            prev = ts.get("live")
+            if live != prev:
+                append_line(HOME / "events.jsonl", {"ts": now_iso(), "source": "watcher", "kind": "observe",
+                                                    "task": tid, "text": f"{prev} -> {live}", "seq": seq})
+                ts["live"] = live
+                if live == "blocked":
+                    self.notify(tid, f"blocked:{seq}", "blocked_dialog",
+                                "worker is at an approval/question dialog; inspect with coord peek "
+                                "(the watcher never answers dialogs)")
+                elif live in ("exited", "gone", "replaced"):
+                    self.notify(tid, f"exit:{wkey}", "exited", f"worker {live} without being cancelled")
+                elif live in ("idle", "done") and worker.get("prompted"):
+                    ts["idle_since"], ts["idle_seq"] = now, seq  # idle before the kickoff is not a result
+                elif live == "working":
+                    ts["idle_since"], ts["turn_reported"] = None, False
+            if live in ("idle", "done") and ts.get("idle_since") and now - ts["idle_since"] >= confirm:
+                ts["idle_since"] = None
+                if not ts.get("turn_reported"):
+                    ts["turn_reported"] = True
+                    self.notify(tid, f"idle:{ts.get('idle_seq')}", "idle_no_report",
+                                "turn ended without a final report (completion candidate, not success)")
+        self.save()
+
+    def active_panes(self) -> tuple[str, ...]:
+        reg = load_registry()
+        return tuple(sorted(t["worker"]["pane_id"] for t in reg["tasks"].values()
+                            if t.get("worker") and t["state"] not in TERMINAL_STATES))
+
+    def subscribe(self, panes: tuple[str, ...]) -> None:
+        self.close_sub()
+        subs: list[dict] = [{"type": "pane.exited"}, {"type": "pane.closed"}]
+        subs += [{"type": "pane.agent_status_changed", "pane_id": p} for p in panes if pane_exists(p)]
+        path = os.environ.get("HERDR_SOCKET_PATH") or str(Path("~/.config/herdr/herdr.sock").expanduser())
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(path)
+        s.sendall((json.dumps({"id": "coord-watch", "method": "events.subscribe",
+                               "params": {"subscriptions": subs}}) + "\n").encode())
+        first = s.makefile("r").readline()
+        ack = json.loads(first) if first else {}
+        if "error" in ack or not first:
+            s.close()
+            raise CoordError(f"subscribe failed: {ack.get('error') or 'connection closed'}")
+        s.setblocking(False)
+        self.sub, self.sub_panes, self.buf = s, panes, b""
+        self.log(f"subscribed: {len(subs) - 2} worker pane(s) + exit/close events")
+
+    def close_sub(self) -> None:
+        if self.sub:
+            try:
+                self.sub.close()
+            except OSError:
+                pass
+        self.sub, self.sub_panes = None, None
+
+    def drain(self) -> None:
+        """Read pending event lines; events only invalidate state, so the next reconcile re-reads."""
+        assert self.sub
+        try:
+            data = self.sub.recv(65536)
+        except BlockingIOError:
+            return
+        if not data:
+            raise ConnectionError("event stream closed")
+        self.buf += data
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            msg = json.loads(line or b"{}")
+            if "error" in msg:
+                raise ConnectionError(f"event stream error: {msg['error']}")
+
+    def run(self) -> None:
+        with locked(HOME / "watcher.lock", blocking=False):
+            atomic_write(HOME / "watcher.pid", str(os.getpid()))
+            signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stop", True))
+            signal.signal(signal.SIGINT, lambda *_: setattr(self, "stop", True))
+            self.log(f"watcher started pid={os.getpid()} home={HOME}")
+            poll = self.policy["watch"]["poll_seconds"]
+            backoff = 1
+            while not self.stop:
+                try:
+                    panes = self.active_panes()
+                    if self.sub is None or panes != self.sub_panes:
+                        self.subscribe(panes)
+                    self.reconcile()
+                    pending = any(t.get("idle_since") for t in self.state["tasks"].values())
+                    wait = 1 if pending else poll
+                    ready, _, _ = select.select([self.sub], [], [], wait)
+                    if ready:
+                        self.drain()
+                        time.sleep(0.3)  # let bursts settle before reconciling
+                    backoff = 1
+                except (OSError, ConnectionError, CoordError, ValueError, subprocess.SubprocessError) as exc:
+                    self.log(f"recovering after error: {exc}")
+                    self.close_sub()
+                    time.sleep(min(backoff, 30))
+                    backoff *= 2
+            self.close_sub()
+            (HOME / "watcher.pid").unlink(missing_ok=True)
+            self.log("watcher stopped")
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    if args.action == "run":
+        Watcher().run()
+    elif args.action == "start":
+        guard_not_worker()
+        pid = watcher_pid()
+        if pid:
+            print(f"watcher already running (pid {pid})")
+            return
+        with open(HOME / "watcher.log", "a") as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch", "run"],
+                             stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
+                             env={**os.environ, "COORD_HOME": str(HOME)})
+        for _ in range(20):
+            time.sleep(0.25)
+            if watcher_pid():
+                print(f"watcher started (pid {watcher_pid()}), log {HOME / 'watcher.log'}")
+                return
+        raise CoordError(f"watcher did not start; see {HOME / 'watcher.log'}")
+    elif args.action == "stop":
+        pid = watcher_pid()
+        if not pid:
+            print("watcher not running")
+            return
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(40):
+            if not watcher_pid():
+                print(f"watcher stopped (pid {pid})")
+                return
+            time.sleep(0.25)
+        raise CoordError(f"watcher pid {pid} did not stop")
+    elif args.action == "status":
+        pid = watcher_pid()
+        print(f"watcher {'running pid ' + str(pid) if pid else 'stopped'}; unread={len(unread_inbox())}")
+    elif args.action == "log":
+        os.execvp("tail", ["tail", "-n", "30", "-F", str(HOME / "watcher.log")])
+
+
+# ------------------------------------------------------------------- inbox
+
+def inbox_cursor() -> int:
+    try:
+        return int((HOME / "inbox.cursor").read_text().strip() or 0)
+    except FileNotFoundError:
+        return 0
+
+
+def unread_inbox() -> list[dict]:
+    cur = inbox_cursor()
+    return [e for e in read_jsonl(HOME / "inbox.jsonl") if e.get("id", 0) > cur]
+
+
+def cmd_inbox(args: argparse.Namespace) -> None:
+    """Print unread notifications; with --wait, block until one arrives (used to wake the coordinator)."""
+    guard_not_worker()
+    if args.all:
+        entries = read_jsonl(HOME / "inbox.jsonl")[-args.limit:]
+    elif args.wait:
+        with locked(HOME / "inbox.wait.lock", blocking=False):
+            deadline = time.time() + args.timeout if args.timeout else None
+            last_check = 0.0
+            while not (entries := unread_inbox()):
+                if deadline and time.time() > deadline:
+                    print("no notifications (timeout)")
+                    return
+                if time.time() - last_check > 30:
+                    last_check = time.time()
+                    if not watcher_pid():
+                        print("WATCHER NOT RUNNING: start it with `coord watch start`, then re-arm the inbox wait")
+                        return
+                time.sleep(1)
+            time.sleep(args.batch)
+            entries = unread_inbox()
+    else:
+        entries = unread_inbox()
+    if not entries:
+        print("no unread notifications")
+        return
+    for e in entries:
+        print(f"#{e['id']} {e['ts'][11:19]} [{e['task']}] {e['kind']}: {e['text']}")
+    if not args.all and not args.peek:
+        atomic_write(HOME / "inbox.cursor", str(max(e["id"] for e in entries)))
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    """Reconcile saved records with live sessions, Git, and result files; never launches anything."""
+    guard_not_worker()
+    agents = live_agents()
+    with registry_edit() as reg:
+        changes = sync_states(reg, agents)
+    reg = load_registry()
+    print("\n".join(changes) or "registry already consistent with live state")
+    for tid, task in reg["tasks"].items():
+        if task["state"] in TERMINAL_STATES or task["state"] == "planned":
+            continue
+        live, _ = live_state(task, agents)
+        notes = []
+        for w in task.get("worktrees", []):
+            if not Path(w["worktree"]).exists():
+                notes.append(f"worktree missing {w['worktree']}")
+            else:
+                head = git(w["worktree"], "rev-parse", "--short", "HEAD")
+                notes.append(f"{w['repo']}@{head}")
+        res = task_dir(tid) / "result.md"
+        notes.append("result.md present" if res.exists() else "no result yet")
+        sid = (task.get("worker") or {}).get("session_id")
+        print(f"{tid}: state={task['state']} live={live} session={sid} {'; '.join(notes)}")
+        if live in ("exited", "gone"):
+            print(f"  -> worker not running; to continue the same Claude session: coord relaunch {tid}")
+    if not watcher_pid():
+        print("watcher stopped -> starting")
+        cmd_watch(argparse.Namespace(action="start"))
+    unread = unread_inbox()
+    print(f"{len(unread)} unread notification(s); run `coord inbox`")
+
+
+# --------------------------------------------------------------------- cli
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="coord", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="create COORD_HOME and default policy (never overwrites)").set_defaults(fn=cmd_init)
+    sub.add_parser("coordinator", help="record this session as the coordinator").set_defaults(fn=cmd_coordinator)
+
+    r = sub.add_parser("repo", help="register repositories").add_subparsers(dest="action", required=True)
+    ra = r.add_parser("add")
+    ra.add_argument("name")
+    ra.add_argument("path")
+    ra.add_argument("--kind", choices=("repo", "monorepo"), default="repo")
+    ra.add_argument("--shared", action="append", help="shared path (contracts, generated files)")
+    ra.add_argument("--instructions", action="append", help="extra instruction file")
+    ra.set_defaults(fn=cmd_repo_add)
+    r.add_parser("list").set_defaults(fn=cmd_repo_list)
+
+    i = sub.add_parser("initiative").add_subparsers(dest="action", required=True)
+    ia = i.add_parser("add")
+    ia.add_argument("id")
+    ia.add_argument("--title", required=True)
+    ia.add_argument("--goal")
+    ia.add_argument("--repos", nargs="+")
+    ia.add_argument("--order", help="integration order, comma separated repos")
+    ia.add_argument("--interface", action="append", help="interface expectation")
+    ia.set_defaults(fn=cmd_initiative_add)
+
+    dc = sub.add_parser("decide", help="record a decision on an initiative")
+    dc.add_argument("initiative")
+    dc.add_argument("text")
+    dc.set_defaults(fn=cmd_decide)
+
+    t = sub.add_parser("task").add_subparsers(dest="action", required=True)
+    ta = t.add_parser("add")
+    ta.add_argument("--title", required=True)
+    ta.add_argument("--id", help="explicit stable id (idempotent re-add)")
+    ta.add_argument("--repo", action="append", required=True, help="NAME[:edit|read]")
+    ta.add_argument("--initiative")
+    ta.add_argument("--tier", default="routine")
+    ta.add_argument("--model")
+    ta.add_argument("--effort")
+    ta.add_argument("--objective")
+    ta.add_argument("--accept", action="append", help="acceptance criterion")
+    ta.add_argument("--context")
+    ta.add_argument("--constraint", action="append")
+    ta.add_argument("--validate", action="append", help="validation command")
+    ta.add_argument("--paths", action="append", help="permitted path ([repo:]path)")
+    ta.add_argument("--depends-on", action="append")
+    ta.add_argument("--brief-file")
+    ta.add_argument("--permission-mode")
+    ta.add_argument("--readonly", action="store_true")
+    ta.set_defaults(fn=cmd_task_add)
+    ts = t.add_parser("set", help="override model/effort/tier for the next launch")
+    ts.add_argument("task")
+    ts.add_argument("--tier")
+    ts.add_argument("--model")
+    ts.add_argument("--effort")
+    ts.add_argument("--reason")
+    ts.add_argument("--read-path", action="append",
+                    help="REPO=PATH for a read-only repo (e.g. another task's worktree)")
+    ts.set_defaults(fn=cmd_task_set)
+
+    la = sub.add_parser("launch", help="start a worker for a planned task")
+    la.add_argument("task")
+    la.add_argument("--dry-run", action="store_true", help="print command/env/worktrees; no side effects")
+    la.add_argument("--fork-from", help="fork this Claude session id instead of starting fresh")
+    la.add_argument("--ignore-deps", action="store_true")
+    la.add_argument("--allow-overlap", action="store_true")
+    la.set_defaults(fn=cmd_launch)
+
+    k = sub.add_parser("kick", help="send the kickoff prompt if launch stopped before it")
+    k.add_argument("task")
+    k.set_defaults(fn=cmd_kick)
+
+    co = sub.add_parser("close", help="stop a finished worker and close its pane")
+    co.add_argument("task")
+    co.add_argument("--force", action="store_true", help="interrupt even if working")
+    co.set_defaults(fn=cmd_close)
+
+    rl = sub.add_parser("relaunch", help="restart a worker, resuming its session")
+    rl.add_argument("task")
+    rl.add_argument("--tier")
+    rl.add_argument("--model")
+    rl.add_argument("--effort")
+    rl.add_argument("--reason")
+    rl.add_argument("--message", help="extra instruction appended to the resume prompt")
+    rl.add_argument("--stop", action="store_true", help="stop a live (idle) worker first")
+    rl.add_argument("--force", action="store_true", help="with --stop: interrupt even if working")
+    rl.add_argument("--fresh", action="store_true", help="start a new session instead of resuming")
+    rl.add_argument("--allow-overlap", action="store_true")
+    rl.set_defaults(fn=cmd_relaunch)
+
+    es = sub.add_parser("escalate", help="create a focused escalation task")
+    es.add_argument("task")
+    es.add_argument("--question", required=True)
+    es.add_argument("--context", help="what was tried / completed (do not repeat)")
+    es.add_argument("--accept", action="append")
+    es.add_argument("--tier", default="exceptional")
+    es.add_argument("--model")
+    es.add_argument("--effort")
+    es.set_defaults(fn=cmd_escalate)
+
+    pr = sub.add_parser("prompt", help="redirect a live worker")
+    pr.add_argument("task")
+    pr.add_argument("text")
+    pr.set_defaults(fn=cmd_prompt)
+
+    ca = sub.add_parser("cancel")
+    ca.add_argument("task")
+    ca.add_argument("--reason")
+    ca.set_defaults(fn=cmd_cancel)
+
+    se = sub.add_parser("set", help="coordinator state transition (e.g. validated)")
+    se.add_argument("task")
+    se.add_argument("--state", required=True, choices=TASK_STATES)
+    se.add_argument("--evidence")
+    se.add_argument("--note")
+    se.set_defaults(fn=cmd_set)
+
+    rp = sub.add_parser("report", help="(worker) report state")
+    rp.add_argument("--state", required=True, choices=REPORT_STATES)
+    rp.add_argument("--summary", required=True)
+    rp.add_argument("--task", help=argparse.SUPPRESS)
+    rp.set_defaults(fn=cmd_report)
+
+    st = sub.add_parser("status")
+    st.add_argument("--all", action="store_true")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--no-sync", action="store_true")
+    st.set_defaults(fn=cmd_status)
+
+    sh = sub.add_parser("show")
+    sh.add_argument("task")
+    sh.set_defaults(fn=cmd_show)
+
+    pk = sub.add_parser("peek", help="read the worker's terminal")
+    pk.add_argument("task")
+    pk.add_argument("--lines", type=int, default=60)
+    pk.set_defaults(fn=cmd_peek)
+
+    ve = sub.add_parser("verify", help="check actual model/effort against requested")
+    ve.add_argument("task", nargs="?")
+    ve.set_defaults(fn=cmd_verify)
+
+    cl = sub.add_parser("cleanup", help="remove a finished task's worktrees (keeps branches)")
+    cl.add_argument("task")
+    cl.add_argument("--yes", action="store_true")
+    cl.set_defaults(fn=cmd_cleanup)
+
+    w = sub.add_parser("watch")
+    w.add_argument("action", choices=("start", "stop", "status", "run", "log"))
+    w.set_defaults(fn=cmd_watch)
+
+    ib = sub.add_parser("inbox", help="read notifications")
+    ib.add_argument("--wait", action="store_true")
+    ib.add_argument("--timeout", type=int, default=0, help="seconds (0 = forever)")
+    ib.add_argument("--batch", type=float, default=3.0, help="seconds to collect a burst")
+    ib.add_argument("--peek", action="store_true", help="do not mark as read")
+    ib.add_argument("--all", action="store_true")
+    ib.add_argument("--limit", type=int, default=30)
+    ib.set_defaults(fn=cmd_inbox)
+
+    sub.add_parser("resume", help="reconcile state after a restart").set_defaults(fn=cmd_resume)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        args.fn(args)
+    except CoordError as exc:
+        print(f"coord: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

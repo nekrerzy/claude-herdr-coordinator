@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Start (or resume) the coordinator: Opus 5.5 at medium effort, advisor off, session-scoped.
+# Usage: coord-coordinator [--resume <session-id> | --continue] [extra claude args]
+set -euo pipefail
+
+if [ "${HERDR_ENV:-}" != "1" ]; then
+  echo "Not inside a Herdr pane. Open Herdr (run 'herdr' in a terminal), then run this script in a pane." >&2
+  exit 1
+fi
+
+TOOL_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$TOOL_DIR"
+# --effort is session-scoped and leaves room for /effort changes mid-session;
+# CLAUDE_CODE_EFFORT_LEVEL is deliberately not set because it would override /effort.
+exec env CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 \
+  claude --model claude-opus-5-5 --effort medium --name coordinator "$@"

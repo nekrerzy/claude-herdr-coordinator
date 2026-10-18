@@ -1,0 +1,19 @@
+[project]
+name = "coord"
+version = "0.1.0"
+description = "Coordinator/worker workflow over Herdr and Claude Code"
+requires-python = ">=3.12"
+dependencies = []  # runtime is stdlib-only (bin/coord runs on /usr/bin/python3)
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.14"]
+
+[tool.ruff]
+line-length = 120
+include = ["bin/coord", "tests/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
