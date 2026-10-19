@@ -1,0 +1,7 @@
+{
+  "name": "coord-ui",
+  "version": "0.1.0",
+  "author": { "name": "Fernando Navarro" },
+  "description": "coord toolkit guardrails (no push, gh, az, live terraform, AKS, AI trailers, discarding work) and a Workers pane and status line for the coordinator",
+  "types": "./types/index.d.ts"
+}
