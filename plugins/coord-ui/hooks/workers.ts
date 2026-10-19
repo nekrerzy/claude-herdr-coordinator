@@ -61,3 +61,10 @@ export function watcherState(stdout: string): string {
   if (m) return m[1] === 'running' ? 'running' : 'STOPPED'
   return stdout.trim().split('\n')[0] || 'unknown'
 }
+
+/** The coordinator session id coord recorded in registry.json, if any. */
+export function recordedCoordinator(registryText: string): string | undefined {
+  const reg: unknown = JSON.parse(registryText)
+  const coordinator = (reg as { coordinator?: { session_id?: unknown } } | null)?.coordinator
+  return typeof coordinator?.session_id === 'string' && coordinator.session_id !== '' ? coordinator.session_id : undefined
+}

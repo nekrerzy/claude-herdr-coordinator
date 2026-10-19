@@ -6,7 +6,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { WorkerSnapshot } from '../types'
 import { judge } from './guard'
-import { attention, liveMark, parseRows, statusText, watcherState } from './workers'
+import { attention, liveMark, parseRows, recordedCoordinator, statusText, watcherState } from './workers'
 
 const PANE = 'workers'
 const PANE_MS = 5000
@@ -15,8 +15,30 @@ const snapshot = atom({ plugin: 'coord-ui', key: 'snapshot' } as const, null)
 
 type $ = EngineInterface
 
+/**
+ * COORD_ROLE decides when set (coord-coordinator sets `coordinator`, workers get `worker`).
+ * Unset, as in a coordinator started some other way: this session is the one coord
+ * recorded (`coord coordinator`) in $COORD_HOME/registry.json. A match is kept for the
+ * module's life; a miss is asked again, since `coord coordinator` may run after start.
+ */
 async function isCoordinator($: $): Promise<boolean> {
-  return (await $.env.get('HERDR_ENV')) === '1' && (await $.env.get('COORD_ROLE')) === 'coordinator'
+  if ((await $.env.get('HERDR_ENV')) !== '1') return false
+  const role = await $.env.get('COORD_ROLE')
+  if (role !== undefined) return role === 'coordinator'
+  isRecordedCoordinator ||= await isRecordedSession($)
+  return isRecordedCoordinator
+}
+
+async function isRecordedSession($: $): Promise<boolean> {
+  try {
+    const home = await $.env.get('HOME')
+    const coordHome = (await $.env.get('COORD_HOME')) ?? '~/.local/share/coord'
+    const dir = coordHome === '~' || coordHome.startsWith('~/') ? `${home}${coordHome.slice(1)}` : coordHome
+    const recorded = recordedCoordinator(await $.fs.read(`${dir}/registry.json`))
+    return recorded !== undefined && recorded === (await $.session.id())
+  } catch {
+    return false
+  }
 }
 
 /** Runs `coord status` (and, for the pane, `coord watch status`); never throws. */
@@ -41,6 +63,7 @@ async function refresh($: $, withWatcher: boolean): Promise<void> {
 
 // Module state: a hot reload drops it with the timers; the next prompt re-arms them.
 let isRegistered = false
+let isRecordedCoordinator = false
 let statusTimer: Timer | undefined
 let paneTimer: Timer | undefined
 let busy = false

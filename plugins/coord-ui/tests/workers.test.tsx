@@ -196,3 +196,64 @@ describe('roles', () => {
     })
   }
 })
+
+describe('coordinator fallback: no COORD_ROLE, the session coord recorded', () => {
+  const REGISTRY = JSON.stringify({ version: 1, tasks: {}, coordinator: { session_id: 'sess-coord', pane_id: 'w1:p1' } })
+  for (const [sessionId, isCoordinator] of [['sess-coord', true], ['sess-other', false]] as const) {
+    test(`session ${sessionId} ${isCoordinator ? 'is' : 'is not'} the coordinator`, async ($, on) => {
+      mock.env(on, { HERDR_ENV: '1', HOME: '/home/u' })
+      const clock = mock.clock(on)
+      const read: string[] = []
+      on('fs.read', ($, e) => {
+        read.push(e.path)
+        return { value: REGISTRY }
+      })
+      on('session.id', () => ({ value: sessionId }))
+      const registered: string[] = []
+      on('command.register', ($, e) => {
+        registered.push(e.name)
+        return { value: { command: e.name } }
+      })
+      const lines = fakeCoord(on, { stdout: JSON.stringify(NORMAL) })
+      on('ui.panes', () => ({ value: [] }))
+      on('session.start', ($, e) => ({ cwd: e.cwd }))
+      await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+      await clock.settle()
+      expect(read).toEqual(['/home/u/.local/share/coord/registry.json'])
+      expect(registered).toEqual(isCoordinator ? ['workers'] : [])
+      expect(lines.at(-1)).toBe(isCoordinator ? 'coord: 1 running · 0 need you' : undefined)
+    })
+  }
+
+  test('COORD_ROLE=worker decides without reading the registry', async ($, on) => {
+    mock.env(on, { HERDR_ENV: '1', COORD_ROLE: 'worker', HOME: '/home/u' })
+    let reads = 0
+    on('fs.read', () => {
+      reads++
+      return { value: REGISTRY }
+    })
+    on('session.id', () => ({ value: 'sess-coord' }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    expect(reads).toBe(0)
+  })
+
+  test('COORD_HOME is honoured and a missing registry means not the coordinator', async ($, on) => {
+    mock.env(on, { HERDR_ENV: '1', HOME: '/home/u', COORD_HOME: '/srv/coord' })
+    const read: string[] = []
+    on('fs.read', ($, e) => {
+      read.push(e.path)
+      return { deny: 'ENOENT' }
+    })
+    on('session.id', () => ({ value: 'sess-coord' }))
+    const registered: string[] = []
+    on('command.register', ($, e) => {
+      registered.push(e.name)
+      return { value: { command: e.name } }
+    })
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    expect(read).toEqual(['/srv/coord/registry.json'])
+    expect(registered).toEqual([])
+  })
+})
