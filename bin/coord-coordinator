@@ -12,5 +12,10 @@ TOOL_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 cd "$TOOL_DIR"
 # --effort is session-scoped and leaves room for /effort changes mid-session;
 # CLAUDE_CODE_EFFORT_LEVEL is deliberately not set because it would override /effort.
-exec env CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 \
-  claude --model claude-opus-5-5 --effort medium --name coordinator "$@"
+# COORD_ROLE=coordinator turns on the coord-ui mod's /workers pane and status line.
+PLUGIN_ARGS=()
+if [ -d "$TOOL_DIR/plugins/coord-ui" ]; then
+  PLUGIN_ARGS=(--plugin-dir "$TOOL_DIR/plugins/coord-ui")
+fi
+exec env CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 COORD_ROLE=coordinator \
+  claude --model claude-opus-5-5 --effort medium --name coordinator "${PLUGIN_ARGS[@]}" "$@"

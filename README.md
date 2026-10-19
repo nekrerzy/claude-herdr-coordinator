@@ -22,6 +22,7 @@ repo notes, tasks, results and memory stay on your machine and never go into thi
 - **Watcher and inbox**: `coord watch` is a deterministic daemon. It follows Herdr events and worker
   reports and appends notifications to `inbox.jsonl`. A background `coord inbox --wait` in the coordinator
   session wakes it up. Nobody polls the workers.
+- **coord-ui mod** (`plugins/coord-ui`): loaded into the coordinator and every worker; it blocks pushes, `gh`, `az`, live Terraform, AKS, AI commit trailers and discarding uncommitted work, and gives the coordinator a `/workers` pane and a status line.
 
 `docs/OPERATING.md` is the command reference.
 
@@ -153,4 +154,5 @@ is missing, and the next `coord resume` rewrites those registry paths.
 ```bash
 uv run pytest -q
 uv run ruff check && uv run ruff format --check
+claude plugin validate plugins/coord-ui && claude plugin test plugins/coord-ui
 ```

@@ -51,6 +51,24 @@ coord relaunch <task> --model claude-opus-5-5 --effort high --stop --reason "...
 Every worker gets `--model`, `--effort`, `CLAUDE_CODE_EFFORT_LEVEL` (highest precedence), and `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`.
 Workers also get `--disallowedTools` denying coordinator-only `coord` subcommands, `herdr`, and edits to `registry.json`, so worker management stays with the coordinator. This is enforced by Claude permissions; it is not an OS sandbox.
 
+## Guardrails and the Workers pane (coord-ui mod)
+`plugins/coord-ui` is a Claude Code mod (function hooks) loaded with `--plugin-dir` into the coordinator (`coord-coordinator`) and every worker (`coord launch`), from the toolkit checkout. Its Bash and Monitor guard denies, with a reason the model reads:
+
+| Blocked | Reason given |
+|---|---|
+| `git push` in any form (`git -C <dir> push`, `--force`, ...) | the user pushes (SSH passphrase); hand them the command |
+| `gh ...` | gh only works from the user's laptop |
+| `az ...`, `terraform apply/destroy/import`, `terraform state rm/mv`, `make apply` | live Azure/Terraform changes are shown to the user |
+| `kubectl`/`helm` aimed at AKS: a `--context`/`--kube-context` naming `aks`, text containing `aks-bap`, or no context given and the kubeconfig's `current-context` naming `aks` | shown to the user. Allowed: `kind-*` contexts, an explicit lab `--kubeconfig`/`KUBECONFIG=`, offline `kubectl kustomize`/`config`, `helm template`/`lint`/... |
+| `git commit` whose message (`-m`, `-F <file>`, heredoc, `--trailer`) has `Co-Authored-By:`, `Claude-Session:`, `Generated with [Claude Code]` or `claude.com/claude-code` | no AI attribution in commits |
+| `git reset --hard`, `git clean -f...`, `git checkout [--] .`, `git restore .` (not `--staged`) | needs your confirmation; you run it with `!` |
+
+It parses the command with a small shell tokenizer: `&&`, `;`, `|`, subshells, `$(...)`, `env`/`sudo`/`timeout`/`xargs` prefixes, `bash -c`/`eval`, and quoted text (a commit message mentioning `git push` passes). Limits: no alias, function or `$VAR` expansion, no remote commands (`ssh host git push`), and git aliases are not resolved. Edit the rules (commands, subcommands, reasons, markers, offline subcommands) in `plugins/coord-ui/hooks/rules.ts`; a running session reloads the mod when the file changes.
+
+Coordinator only (`HERDR_ENV=1` and `COORD_ROLE=coordinator`, which `coord-coordinator` sets): `/workers` opens a **Workers** pane that runs `coord status --json --no-sync` every 5 s while open (task, live ✓/✗, state, report, repos, model/effort with ✓, next action; rows that need you are marked `▲ DIALOG|BLOCKED|REVIEW|IDLE-NO-REPORT|EXITED|MISMATCH|UNVERIFIED`) plus the watcher state, and the status line shows `coord: <n> running · <m> need you` every 10 s. If `coord` fails, the pane shows the error and the status line clears.
+
+Checks: `claude plugin validate plugins/coord-ui` and `claude plugin test plugins/coord-ui`.
+
 ## Escalate a hard question
 ```bash
 coord escalate <task> --question "..." --context "what was tried / completed"   # Fable 5.1 / high, read-only

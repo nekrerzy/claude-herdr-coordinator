@@ -304,6 +304,22 @@ def test_worker_deny_list_in_launch_command(coord, capsys):
     cmd = json.loads(capsys.readouterr().out)["command"]
     deny = cmd[cmd.index("--disallowedTools") + 1]
     assert "Bash(coord launch *)" in deny and "Bash(herdr *)" in deny and "registry.json" in deny
+    assert cmd[cmd.index("--plugin-dir") + 1] == str(ROOT / "plugins" / "coord-ui")
+
+
+def test_coordinator_launcher_loads_mod_and_sets_role(tmp_path):
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "claude").write_text('#!/bin/sh\necho "role=$COORD_ROLE"\nprintf "%s\\n" "$@"\n')
+    (fakebin / "claude").chmod(0o755)
+    env = {**os.environ, "HERDR_ENV": "1", "PATH": f"{fakebin}:{os.environ['PATH']}"}
+    out = subprocess.run(
+        [str(ROOT / "bin" / "coord-coordinator"), "--continue"], capture_output=True, text=True, env=env
+    )
+    lines = out.stdout.splitlines()
+    assert out.returncode == 0 and lines[0] == "role=coordinator"
+    assert lines[lines.index("--plugin-dir") + 1] == str(ROOT / "plugins" / "coord-ui")
+    assert lines[-1] == "--continue"
 
 
 def make_fakebin(path: Path, claude="2.1.302 (Claude Code)", herdr="herdr 0.9.1", uv="uv 0.12.5") -> Path:

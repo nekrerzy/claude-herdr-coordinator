@@ -917,6 +917,8 @@ def start_worker(
             claude_args += ["--add-dir", target]
     if task.get("permission_mode"):
         claude_args += ["--permission-mode", task["permission_mode"]]
+    if (TOOL_DIR / "plugins" / "coord-ui").is_dir():  # guardrails mod, loaded from the toolkit
+        claude_args += ["--plugin-dir", str(TOOL_DIR / "plugins" / "coord-ui")]
     registry_file = HOME / "registry.json"
     claude_args += [
         "--disallowedTools",
