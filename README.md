@@ -156,3 +156,7 @@ uv run pytest -q
 uv run ruff check && uv run ruff format --check
 claude plugin validate plugins/coord-ui && claude plugin test plugins/coord-ui
 ```
+
+## License
+
+No license: this is a private repository. Add one before making it public.
