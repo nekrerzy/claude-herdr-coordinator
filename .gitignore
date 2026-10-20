@@ -7,3 +7,9 @@ repo-notes/
 # written by Claude Code when it loads the mod from this folder
 plugins/*/.claude-plugin/types/
 plugins/*/tsconfig.json
+# local runtime state, secrets and scratch must never be committed
+.env
+.env.*
+*.jsonl
+tmp/
+node_modules/
